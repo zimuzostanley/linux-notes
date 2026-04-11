@@ -1196,7 +1196,147 @@ unsigned long ino = BPF_CORE_READ(folio, mapping, host, i_ino);
 
 ## Part 12: Building a Page Lifecycle Tracer with eBPF
 
-Now we put it all together. The goal: track every physical page from allocation through page cache insertion, fault, dirty, writeback, I/O, and free. Userspace reads the BPF maps to know who owns any page at any point.
+Now we put it all together. The goal: track every physical page from allocation through page cache insertion, fault, dirty, writeback, I/O, and free. Userspace reads a stream of events from the BPF ring buffer and can reconstruct any page's history at any point.
+
+### Why an event stream, not a per-page struct
+
+The first instinct is to store one struct per page with timestamp fields for each lifecycle stage (`alloc_ts`, `cache_ts`, `dirty_ts`, ...). This has real problems:
+
+1. **You lose history.** A page can go through dirty→writeback→clean→dirty→writeback multiple times. With one timestamp slot per stage, you only see the last cycle.
+2. **You cannot see the current state mid-flight.** Until `free_ts` is set, a polling reader does not know which stage the page is in — it just sees a half-filled struct.
+3. **The struct grows with every new event type.** Adding zram tracking means adding more fields, restructuring the map value, and recompiling everything.
+
+The better model: emit individual **events** into a ring buffer, each tagged with a stable **page_id**. Userspace reads the stream and can reconstruct any page's lifecycle by filtering on its page_id. You can answer "what happened to page 42" and "what is happening right now" and "show me all dirty events in the last second" from the same data.
+
+### The page_id: stable identity across migration
+
+Every tracepoint gives you a PFN (physical frame number). But PFNs are not stable — page migration changes the PFN while the logical page stays the same. If you key everything on PFN, a migration silently breaks the connection between events before and after the move.
+
+The solution is a **page_id** — a monotonically increasing 64-bit integer assigned once when a page is allocated, and never changed. The tracer maintains a small lookup map from PFN to page_id. Every handler looks up the page_id from the PFN, and every event carries the page_id. When migration happens, only the lookup map needs updating.
+
+We generate page_ids inside BPF using an atomic counter in an array map — no kernel patches needed.
+
+### The maps
+
+Four maps, each with a clear purpose:
+
+```c
+// ── Map 1: page_id generator ──
+// A single-element array holding the next page_id to assign.
+// Atomically incremented on each page allocation.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u64);
+} page_id_counter SEC(".maps");
+
+// ── Map 2: PFN → page_id lookup ──
+// This is the bridge between what tracepoints give us (PFN) and
+// our stable identifier (page_id). Updated on alloc, free, and migration.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 131072);
+    __type(key, u64);              // pfn
+    __type(value, u64);            // page_id
+} pfn_to_id SEC(".maps");
+
+// ── Map 3: event ring buffer ──
+// All events flow through here to userspace. Lock-free, multi-producer.
+// Sized at 16MB — enough for ~200K events before wrapping.
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 16 * 1024 * 1024);
+} events SEC(".maps");
+
+// ── Map 4: filter configuration ──
+// Userspace writes this to control what we trace.
+// Without a filter, tracking ALL user pages on a busy system will
+// overwhelm the ring buffer within seconds.
+struct trace_filter {
+    u32 filter_type;  // 0=off, 1=by_tgid, 2=by_ino
+    u32 tgid;
+    u64 ino;
+    u64 dev;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct trace_filter);
+} filter SEC(".maps");
+```
+
+**Why a filter is not optional.** A typical Android phone allocates and frees tens of thousands of pages per second. Without filtering, the ring buffer fills up in under a second even at 64MB. The filter lets you target a specific process (`filter_type=1`) or a specific file (`filter_type=2`), reducing volume by orders of magnitude. The filter is checked early in each handler to avoid wasting cycles on pages we do not care about.
+
+Note that `on_page_alloc` fires before we know *what* the page is for — it could become file-backed, anonymous, slab, anything. So `on_page_alloc` can only filter by tgid (the allocating process). The ino/dev filter kicks in at `on_cache_add`, which is the earliest point where we know the file. Pages that fail the ino filter at `on_cache_add` should be retroactively cleaned out of `pfn_to_id` to avoid map bloat.
+
+### The event struct
+
+Every event is the same struct. The `event_type` field tells you what happened; the rest is a union of event-specific data. This keeps the ring buffer entries uniform and easy to parse.
+
+```c
+enum event_type {
+    EVT_ALLOC        = 0,
+    EVT_FREE         = 1,
+    EVT_CACHE_INSERT = 2,
+    EVT_CACHE_REMOVE = 3,
+    EVT_FAULT        = 4,
+    EVT_DIRTY        = 5,
+    EVT_WRITEBACK    = 6,
+    EVT_WB_DONE      = 7,
+    EVT_IO_ISSUE     = 8,
+    EVT_IO_COMPLETE  = 9,
+    EVT_ANON_FAULT   = 10,
+    EVT_COW          = 11,
+    EVT_MIGRATE      = 12,
+    EVT_ZRAM_COMPRESS = 13,
+};
+
+struct page_event {
+    u64 page_id;          // stable identity — survives migration
+    u64 pfn;              // current physical frame number
+    u64 ts;               // bpf_ktime_get_ns()
+    u32 event_type;       // enum event_type
+    u32 cpu;              // which CPU this happened on
+    u32 tgid;             // process context (0 for kernel threads)
+    u32 order;            // folio order (0 = 4KB, 4 = 64KB, 9 = 2MB)
+
+    // event-specific fields — only relevant fields are set per event type
+    union {
+        struct {                  // EVT_ALLOC
+            u64 gfp_flags;
+            char comm[16];
+        } alloc;
+        struct {                  // EVT_CACHE_INSERT, EVT_CACHE_REMOVE
+            u64 ino;
+            u64 dev;
+            u64 index;            // file offset in pages
+        } cache;
+        struct {                  // EVT_FAULT, EVT_ANON_FAULT
+            u64 address;          // virtual address
+            u8  is_write;
+        } fault;
+        struct {                  // EVT_COW
+            u64 old_page_id;      // the page we copied from
+            u64 address;
+        } cow;
+        struct {                  // EVT_MIGRATE
+            u64 old_pfn;
+            u64 new_pfn;
+            u32 reason;           // MR_COMPACTION, MR_NUMA_MISPLACED, etc.
+        } migrate;
+        struct {                  // EVT_IO_ISSUE, EVT_IO_COMPLETE
+            u64 sector;
+            u64 dev;
+            u32 nr_sectors;
+        } io;
+        struct {                  // EVT_ZRAM_COMPRESS
+            u32 compressed_size;
+        } zram;
+    };
+};
+```
 
 ### Available stock tracepoints
 
@@ -1223,75 +1363,95 @@ These exist in any kernel with tracing enabled — no patches needed:
 | zRAM compress | `zram_write_page` | page, compressed size |
 | Page migration | `migrate_folio_move` | old and new folio, reason |
 
-### The data model
+### Helper: emitting an event
 
-We store one entry per tracked page:
-
-```c
-struct page_info {
-    u64 pfn;
-    u32 order;
-    u64 alloc_ts;           // when allocated
-    u64 cache_ts;           // when entered page cache
-    u64 fault_ts;           // when faulted into a process
-    u64 dirty_ts;           // when first dirtied
-    u64 writeback_ts;       // when writeback started
-    u64 io_issue_ts;        // when I/O was sent to disk
-    u64 io_complete_ts;     // when I/O finished
-    u64 free_ts;            // when freed
-    u64 dev;                // device major:minor
-    u64 ino;                // inode number (identifies the file)
-    u64 index;              // offset within the file (in pages)
-    u32 tgid;               // process that faulted it in
-    char comm[16];          // process name
-    u8  page_type;          // file-backed, anonymous, or shmem
-};
-```
-
-And two maps:
+Every handler follows the same pattern — look up page_id from PFN, reserve space in the ring buffer, fill in the event, submit. We factor this into a helper:
 
 ```c
-// Central lifecycle map: pfn → page_info
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65536);
-    __type(key, u64);              // pfn
-    __type(value, struct page_info);
-} page_map SEC(".maps");
+// Look up page_id for a given PFN. Returns 0 if not tracked.
+static __always_inline u64 get_page_id(u64 pfn) {
+    u64 *id = bpf_map_lookup_elem(&pfn_to_id, &pfn);
+    return id ? *id : 0;
+}
 
-// Filter: which process or file to trace
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, u32);
-    __type(value, struct trace_filter);
-} filter SEC(".maps");
+// Allocate the next page_id (called only from on_page_alloc).
+static __always_inline u64 next_page_id(void) {
+    u32 zero = 0;
+    u64 *counter = bpf_map_lookup_elem(&page_id_counter, &zero);
+    if (!counter) return 0;
+    // __sync_fetch_and_add returns the value BEFORE incrementing.
+    // We add 1 so page_ids start at 1, not 0 — because 0 means
+    // "not tracked" in get_page_id().
+    return __sync_fetch_and_add(counter, 1) + 1;
+}
+
+// Reserve + submit a page_event to the ring buffer.
+// Returns a pointer to fill in event-specific fields, or NULL on failure.
+static __always_inline struct page_event *emit(u64 page_id, u64 pfn,
+                                                u32 type, u32 order) {
+    struct page_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) return NULL;
+
+    // bpf_ringbuf_reserve does NOT zero memory. We must initialize
+    // everything — including the union — to avoid leaking stale data
+    // from a prior event that occupied this slot.
+    __builtin_memset(e, 0, sizeof(*e));
+
+    e->page_id = page_id;
+    e->pfn = pfn;
+    e->ts = bpf_ktime_get_ns();
+    e->event_type = type;
+    e->cpu = bpf_get_smp_processor_id();
+    e->tgid = bpf_get_current_pid_tgid() >> 32;
+    e->order = order;
+
+    return e;  // caller fills in the union, then calls bpf_ringbuf_submit(e, 0)
+}
 ```
 
-### Handler: page allocation
+### Handler: page allocation (assigns page_id)
+
+This is the only handler that creates a new page_id. Every other handler looks it up.
 
 ```c
 SEC("tracepoint/kmem/mm_page_alloc")
 int on_page_alloc(struct trace_event_raw_mm_page_alloc *ctx) {
     u64 pfn = ctx->pfn;
-    if (pfn == (u64)-1) return 0;  // allocation failed
+    if (pfn == (u64)-1) return 0;              // allocation failed
 
-    // Only track user pages (GFP_HIGHUSER_MOVABLE has __GFP_MOVABLE = 0x08)
+    // Only track user pages (__GFP_MOVABLE = 0x08)
     if (!(ctx->gfp_flags & 0x08)) return 0;
 
-    u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    // Check filter (tgid-only at this point — we don't know the file yet)
+    u32 zero = 0;
+    struct trace_filter *f = bpf_map_lookup_elem(&filter, &zero);
+    if (!f || f->filter_type == 0) return 0;   // filter off → don't track
+    if (f->filter_type == 1) {
+        u32 tgid = bpf_get_current_pid_tgid() >> 32;
+        if (tgid != f->tgid) return 0;
+    }
+    // For filter_type == 2 (by ino), we must track optimistically here
+    // and clean up in on_cache_add if the inode doesn't match.
 
-    struct page_info info = {};
-    info.pfn = pfn;
-    info.order = ctx->order;
-    info.alloc_ts = bpf_ktime_get_ns();
-    info.tgid = tgid;
-    bpf_get_current_comm(&info.comm, sizeof(info.comm));
+    // Assign a new stable page_id
+    u64 page_id = next_page_id();
+    if (!page_id) return 0;
 
-    bpf_map_update_elem(&page_map, &pfn, &info, BPF_ANY);
+    // Register in the lookup map
+    bpf_map_update_elem(&pfn_to_id, &pfn, &page_id, BPF_ANY);
+
+    // Emit event
+    struct page_event *e = emit(page_id, pfn, EVT_ALLOC, ctx->order);
+    if (!e) return 0;
+
+    e->alloc.gfp_flags = ctx->gfp_flags;
+    bpf_get_current_comm(&e->alloc.comm, sizeof(e->alloc.comm));
+    bpf_ringbuf_submit(e, 0);
     return 0;
 }
 ```
+
+**A note on large folios.** When `order > 0`, the tracepoint reports the PFN of the first page in the compound allocation. We register that PFN in `pfn_to_id`. Subsequent tracepoints (e.g., `mm_filemap_add_to_page_cache`) also report the first-page PFN for the folio, so the lookup works correctly. However, if something references an *interior* page of a large folio by its PFN, our lookup would miss it. In practice this is not a problem: the mm subsystem consistently uses the folio head page's PFN in tracepoints and function arguments. The `order` field in the event tells userspace how many physical pages this folio spans.
 
 ### Handler: page enters page cache
 
@@ -1299,90 +1459,233 @@ int on_page_alloc(struct trace_event_raw_mm_page_alloc *ctx) {
 SEC("tracepoint/filemap/mm_filemap_add_to_page_cache")
 int on_cache_add(struct trace_event_raw_mm_filemap_op_page_cache *ctx) {
     u64 pfn = ctx->pfn;
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
 
-    struct page_info *info = bpf_map_lookup_elem(&page_map, &pfn);
-    if (!info) return 0;
+    struct page_event *e = emit(page_id, pfn, EVT_CACHE_INSERT, ctx->order);
+    if (!e) return 0;
 
-    info->cache_ts = bpf_ktime_get_ns();
-    info->ino = ctx->i_ino;
-    info->dev = ctx->s_dev;
-    info->index = ctx->index;
-    info->page_type = 1;  // file-backed
-
+    e->cache.ino = ctx->i_ino;
+    e->cache.dev = ctx->s_dev;
+    e->cache.index = ctx->index;
+    bpf_ringbuf_submit(e, 0);
     return 0;
 }
 ```
 
-### Handler: page freed
+### Handler: page freed (cleans up lookup map)
 
 ```c
 SEC("tracepoint/kmem/mm_page_free")
 int on_page_free(struct trace_event_raw_mm_page_free *ctx) {
     u64 pfn = ctx->pfn;
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
 
-    struct page_info *info = bpf_map_lookup_elem(&page_map, &pfn);
-    if (!info) return 0;
+    struct page_event *e = emit(page_id, pfn, EVT_FREE, ctx->order);
+    if (!e) goto cleanup;
 
-    info->free_ts = bpf_ktime_get_ns();
-    // Don't delete — let userspace read the complete lifecycle first
+    bpf_ringbuf_submit(e, 0);
+
+cleanup:
+    // Remove from lookup map — this PFN is no longer tracked
+    bpf_map_delete_elem(&pfn_to_id, &pfn);
     return 0;
 }
 ```
 
-### The userspace reader
+### Handler: page migration (the critical one)
 
-A simple poll loop that iterates the map, finds completed lifecycles (where `free_ts != 0`), prints them, and cleans up:
+This is what keeps everything coherent. When a page migrates from one PFN to another, the page_id stays the same — we just update the lookup map to point the new PFN to the existing page_id.
 
 ```c
+SEC("kprobe/migrate_folio_move")
+int on_migrate(struct pt_regs *ctx) {
+    // migrate_folio_move(put_new_folio, private, src, dst, mode, reason, ret)
+    // src is arg3, dst is arg4 on ARM64
+    struct folio *src = (struct folio *)PT_REGS_PARM3(ctx);
+    struct folio *dst = (struct folio *)PT_REGS_PARM4(ctx);
+    int reason = (int)PT_REGS_PARM6(ctx);
+
+    // Getting the PFN from a struct folio* in BPF.
+    //
+    // In the kernel, page_to_pfn() uses the page's position in the
+    // mem_map array: pfn = page - mem_map. But from BPF we cannot do
+    // pointer arithmetic on kernel addresses that way.
+    //
+    // The practical approach: use a kfunc or read the PFN from a field
+    // that the kernel exposes. On kernels with CONFIG_DEBUG_INFO_BTF,
+    // you can use bpf_page_to_pfn() if available as a kfunc, or use
+    // a tracepoint-based approach instead of a kprobe.
+    //
+    // The cleanest alternative: attach to a kretprobe on
+    // folio_migrate_mapping() and read the PFNs from its arguments,
+    // or add a custom tracepoint that emits both PFNs directly.
+    //
+    // For illustration, assume we have a helper that extracts the PFN:
+    unsigned long old_pfn = folio_to_pfn_helper(src);
+    unsigned long new_pfn = folio_to_pfn_helper(dst);
+
+    // Look up the page_id using the OLD PFN
+    u64 page_id = get_page_id(old_pfn);
+    if (!page_id) return 0;
+
+    // Update the lookup map: delete old PFN, insert new PFN
+    bpf_map_delete_elem(&pfn_to_id, &old_pfn);
+    bpf_map_update_elem(&pfn_to_id, &new_pfn, &page_id, BPF_ANY);
+
+    // Emit the migration event
+    struct page_event *e = emit(page_id, new_pfn, EVT_MIGRATE, 0);
+    if (!e) return 0;
+
+    e->migrate.old_pfn = old_pfn;
+    e->migrate.new_pfn = new_pfn;
+    e->migrate.reason = reason;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+```
+
+**Getting a PFN from a folio pointer in BPF — the hard part.**
+
+In kernel C, `folio_pfn(folio)` is a macro that boils down to `page_to_pfn(&folio->page)`, which computes the page's position in the vmemmap array. From BPF, you cannot directly do this pointer arithmetic because `vmemmap` is a kernel symbol and BPF pointer arithmetic on kernel addresses is restricted by the verifier.
+
+There are three practical approaches:
+
+1. **Use a BPF kfunc.** If your kernel exports `bpf_page_to_pfn` as a kfunc (or you add one), you can call it directly from BPF. This is the cleanest path but requires kernel support.
+2. **Read `vmemmap_base` from a BPF global and do the math.** On x86-64, `vmemmap_base` is a well-known address; on ARM64, it is `VMEMMAP_START`. You can store it in a BPF array map at init time and compute `pfn = (folio_addr - vmemmap_base) / sizeof(struct page)`. This works but is architecture-specific.
+3. **Avoid kprobes for migration entirely.** Instead of hooking `migrate_folio_move`, hook the tracepoints that fire *around* migration — `mm_page_alloc` for the new page and `mm_page_free` for the old page. The new page gets a fresh PFN that you track normally. The cost is losing the explicit link between old and new page. For many workloads this is acceptable.
+
+Without this handler, any event after migration would fail the `get_page_id(new_pfn)` lookup and be silently dropped. The page would appear to vanish mid-lifecycle. With it, the stream of events for a migrated page is seamless — the page_id ties pre-migration and post-migration events together, and the EVT_MIGRATE event itself records when and why the physical address changed.
+
+### Handler: dirty (kprobe, since no stock tracepoint carries PFN)
+
+The stock `writeback_dirty_folio` tracepoint exists but does not carry the PFN — it only has `(name, ino, index)`. We need the PFN to look up the page_id, so we hook `filemap_dirty_folio` directly.
+
+```c
+SEC("kprobe/filemap_dirty_folio")
+int on_dirty(struct pt_regs *ctx) {
+    // filemap_dirty_folio(mapping, folio) — folio is arg2
+    struct folio *folio = (struct folio *)PT_REGS_PARM2(ctx);
+
+    // We face the same PFN extraction problem as the migration handler.
+    // The same three approaches apply (kfunc, vmemmap math, or avoidance).
+    //
+    // An alternative specific to dirty tracking: instead of hooking
+    // filemap_dirty_folio, hook the PTE-level dirty bit setting in
+    // handle_pte_fault (line 6335 in mm/memory.c), where pte_mkdirty()
+    // is called. At that point we have the PTE, and pte_pfn() gives us
+    // the PFN directly. The cost is that we would need to distinguish
+    // first-dirty from re-dirty, which the PTE path does not naturally
+    // expose (both just set the dirty bit).
+    //
+    // For now, assume we can extract the PFN (via kfunc or vmemmap):
+    unsigned long pfn = folio_to_pfn_helper(folio);
+
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+
+    struct page_event *e = emit(page_id, pfn, EVT_DIRTY, 0);
+    if (!e) return 0;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+```
+
+Every other handler follows the same pattern: get PFN from tracepoint/kprobe args → look up page_id → emit event. The pattern is always three lines of boilerplate plus the event-specific fields.
+
+### Bridging the block layer: sector → page_id
+
+The block I/O tracepoints (`block_rq_issue`, `block_rq_complete`) give you sector numbers, not PFNs. To connect an I/O event to a page_id, you need an additional lookup map that records which page_id is associated with which sector. This map gets populated when the filesystem builds the bio (the moment a page's disk sector is known) and consulted when the block tracepoints fire.
+
+```c
+// sector key: (device, sector) pair
+struct sector_key {
+    u64 dev;
+    u64 sector;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct sector_key);
+    __type(value, u64);            // page_id
+} sector_to_id SEC(".maps");
+```
+
+You populate this by hooking `bio_add_folio` (or `bio_add_page`) with a kprobe. At that point, the bio has a sector number and the folio has a PFN (which gives you the page_id). You store `(dev, sector) → page_id`. Then when `block_rq_issue` fires, you look up the sector to find the page_id and emit EVT_IO_ISSUE. When `block_rq_complete` fires, you look up again for EVT_IO_COMPLETE and clean up the entry.
+
+This sector map is the bridge between the mm world (where everything is PFNs and folios) and the block world (where everything is sectors and requests). Without it, your I/O events are disconnected from your page events.
+
+### The userspace reader
+
+Userspace consumes the ring buffer and builds whatever view it wants:
+
+```c
+// Callback invoked for each event in the ring buffer
+int handle_event(void *ctx, void *data, size_t len) {
+    struct page_event *e = data;
+
+    switch (e->event_type) {
+    case EVT_ALLOC:
+        printf("[%lu] ALLOC   page_id=%lu pfn=0x%lx order=%u comm=%s\n",
+               e->ts, e->page_id, e->pfn, e->order, e->alloc.comm);
+        break;
+    case EVT_CACHE_INSERT:
+        printf("[%lu] CACHE+  page_id=%lu ino=%lu offset=%lu\n",
+               e->ts, e->page_id, e->cache.ino, e->cache.index);
+        break;
+    case EVT_DIRTY:
+        printf("[%lu] DIRTY   page_id=%lu\n", e->ts, e->page_id);
+        break;
+    case EVT_MIGRATE:
+        printf("[%lu] MIGRATE page_id=%lu pfn 0x%lx→0x%lx reason=%u\n",
+               e->ts, e->page_id, e->migrate.old_pfn,
+               e->migrate.new_pfn, e->migrate.reason);
+        break;
+    case EVT_FREE:
+        printf("[%lu] FREE    page_id=%lu pfn=0x%lx\n",
+               e->ts, e->page_id, e->pfn);
+        break;
+    // ... other event types ...
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     struct page_tracer_bpf *skel = page_tracer_bpf__open_and_load();
     page_tracer_bpf__attach(skel);
 
-    int map_fd = bpf_map__fd(skel->maps.page_map);
+    struct ring_buffer *rb = ring_buffer__new(
+        bpf_map__fd(skel->maps.events), handle_event, NULL, NULL);
 
+    // Event loop — ring_buffer__poll blocks until events arrive
     while (1) {
-        sleep(1);
-        u64 key = 0, next_key;
-        struct page_info info;
-
-        while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
-            bpf_map_lookup_elem(map_fd, &next_key, &info);
-            if (info.free_ts != 0) {
-                u64 lifetime_us = (info.free_ts - info.alloc_ts) / 1000;
-                printf("pfn=%lx ino=%lu off=%lu lifetime=%luus comm=%s\n",
-                       info.pfn, info.ino, info.index, lifetime_us, info.comm);
-                bpf_map_delete_elem(map_fd, &next_key);
-            }
-            key = next_key;
-        }
+        ring_buffer__poll(rb, 100 /* timeout_ms */);
     }
+
+    ring_buffer__free(rb);
+    page_tracer_bpf__destroy(skel);
+    return 0;
 }
 ```
 
-### The PFN problem and migration
+Because the events are a stream, userspace can do anything with them:
 
-The design above uses PFN as the map key. This works until a page migrates — the PFN changes, and the entry becomes stale. You have a few options:
+- **Live tail**: Print events as they arrive (like the example above).
+- **Per-page reconstruction**: Collect events into a hashmap keyed by page_id. When you see EVT_FREE, you have the complete lifecycle and can compute alloc→free latency, dirty→writeback latency, etc.
+- **Rolling window**: Keep the last N seconds of events in a circular buffer. Answer "what was page_id X doing 3 seconds ago" at any time.
+- **Export to Perfetto/trace_processor**: Serialize each event as a protobuf track event. Build SQL views in trace_processor that pivot the event stream into one-row-per-page tables.
 
-**Option A: Hook migration with a kprobe.** Attach to `migrate_folio_move`. In the handler, look up the old PFN in `page_map`, save the entry, delete the old key, and re-insert under the new PFN.
+### Why this design handles edge cases correctly
 
-**Option B: Use a stable page_id.** Patch the kernel to add a monotonically increasing `page_id` field to `struct folio`, assigned at allocation time, never changed. Use this as the map key instead of PFN, and maintain a separate `pfn_to_page_id` lookup map. Migration updates only the lookup map, not the lifecycle entry.
+**Repeated dirty→writeback cycles.** The old per-page struct had one `dirty_ts` and one `writeback_ts` — you could only see the last cycle. With events, a page that goes through three dirty→writeback cycles produces six events, all with the same page_id. You see the full history.
 
-**Option C: Accept the loss.** On many workloads, migration is infrequent. If you are tracing a specific file or process for a few seconds, you may lose very few pages to migration. Start with option A and move to option B if the data shows gaps.
+**Page migration.** The page_id survives migration. Events before and after migration all carry the same page_id. The EVT_MIGRATE event itself records the PFN change. Userspace does not need to do any PFN stitching.
 
-### Ring buffer vs. hash map polling
+**PFN reuse.** After a page is freed and its PFN is reused for a new allocation, the new page gets a new page_id. Events from the old and new page will have different page_ids even though they share a PFN. There is no ambiguity.
 
-The hash map approach described above has a nice property: each page's lifecycle is accumulated in a single map entry, and you emit one row per page when it is freed. With a ring buffer, you would emit 5-10 events per page (one per lifecycle stage) and reconstruct the lifecycle in userspace.
-
-Ring buffers are better when:
-- You need real-time event streaming (sub-millisecond latency to userspace).
-- Event volume is high and you want to avoid map contention.
-
-Hash maps are better when:
-- You want to correlate multiple events into one record.
-- You can tolerate polling latency (100ms-1s).
-- You want to avoid dropped events (ring buffers can drop under pressure; map updates overwrite in place).
-
-For a page lifecycle tracer, the hash map approach is simpler and sufficient.
+**Ring buffer drops.** Under extreme load, `bpf_ringbuf_reserve` can return NULL (buffer full). The handler returns without emitting — you lose that event. This is the one downside of the ring buffer approach: under pressure, you get gaps. The alternative (a hash map with in-place updates) never drops, but cannot represent event streams. For most tracing workloads, a large enough ring buffer (16-64MB) avoids drops entirely.
 
 ### Building the BPF program
 
