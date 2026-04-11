@@ -1,0 +1,3 @@
+title: "Linux MM, I/O, and eBPF"
+description: "A ground-up technical walkthrough of Linux memory management, block I/O, and eBPF instrumentation"
+theme: jekyll-theme-cayman
