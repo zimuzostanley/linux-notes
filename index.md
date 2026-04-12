@@ -712,35 +712,417 @@ The `folio_wake_bit` call is important — other parts of the kernel (like `fsyn
 
 ## Part 6: The Block I/O Layer — From Pages to Sectors
 
-The block layer sits between the filesystem and the disk driver. Its job is to take `bio` structs from the filesystem and deliver them to the hardware efficiently.
+The block layer sits between the filesystem and the disk driver. Its job is to take `bio` structs from the filesystem and deliver them to the hardware efficiently. This section traces the full read and write paths from userspace syscalls down to hardware and back, because you cannot build a useful tracer without understanding both directions.
 
-### From bio to request
+### The read path: from `read()` to a physical page
 
-When the filesystem calls `submit_bio(bio)`, the block layer does not immediately send it to the disk. Instead, it tries to **merge** the bio with existing pending I/O:
+When userspace calls `read(fd, buf, len)` on a regular file, the VFS routes it through the filesystem's `->read_iter` op, which for most filesystems is `generic_file_read_iter`. That calls `filemap_read`, the core page cache reader at `mm/filemap.c:2768`.
 
-1. **Front merge**: If the new bio's sectors immediately precede an existing request's sectors, prepend it.
-2. **Back merge**: If the new bio's sectors immediately follow an existing request, append it.
-3. **No merge**: Create a new request.
-
-Merging is hugely important for performance. Sequential writes to a file produce bios with consecutive sector numbers. Merging turns 100 small 4KB writes into one 400KB write, which is much faster for the disk — fewer commands, fewer interrupts, better utilization of the disk's internal queues.
-
-### The I/O scheduler
-
-Between the merge logic and the hardware dispatch, an I/O scheduler can reorder requests to minimize seek time (for spinning disks) or optimize flash write patterns (for SSDs/UFS). Modern block devices use `blk-mq` (multi-queue block layer), where each CPU has its own submission queue and the hardware may have multiple command queues.
-
-The tracepoints fire at two critical moments:
+The work of finding pages (either in cache or by faulting them in from disk) is delegated to `filemap_get_pages` at `mm/filemap.c:2667`:
 
 ```c
-// block/blk-mq.c:1372
-// When a request is sent to the disk driver:
+static int filemap_get_pages(struct kiocb *iocb, size_t count,
+        struct folio_batch *fbatch, bool need_uptodate)
+{
+    struct address_space *mapping = filp->f_mapping;
+    pgoff_t index = iocb->ki_pos >> PAGE_SHIFT;
+    pgoff_t last_index = round_up(iocb->ki_pos + count, ...) >> PAGE_SHIFT;
+retry:
+    // ── Step 1: try page cache lookup ──
+    filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
+
+    if (!folio_batch_count(fbatch)) {
+        // Cache miss — no folios found in the requested range.
+        // Fire up synchronous readahead to read from disk.
+        DEFINE_READAHEAD(ractl, filp, &filp->f_ra, mapping, index);
+        page_cache_sync_ra(&ractl, last_index - index);
+
+        // ── Step 2: retry cache lookup after readahead ──
+        filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
+    }
+
+    // ── Step 3: check if we hit the readahead marker ──
+    folio = fbatch->folios[folio_batch_count(fbatch) - 1];
+    if (folio_test_readahead(folio)) {
+        // This folio was the lookahead marker — trigger async readahead
+        // so the NEXT window is pre-fetched while we process this one.
+        filemap_readahead(iocb, filp, mapping, folio, last_index);
+    }
+
+    // ── Step 4: if the folio is in cache but not up-to-date, wait for it ──
+    if (!folio_test_uptodate(folio)) {
+        err = filemap_update_page(iocb, mapping, count, folio, need_uptodate);
+    }
+
+    trace_mm_filemap_get_pages(mapping, index, last_index - 1);
+    return 0;
+}
+```
+
+This is a three-phase dance: cache lookup → readahead → wait. The interesting part is step 3 — the **readahead marker**. When readahead fetches a window of pages, it marks *one* of them (the last page of the "readahead-only" portion) with `PG_readahead`. When userspace reads that specific page, it triggers `filemap_readahead`, which kicks off the *next* async batch. This way, readahead stays one window ahead of the reader without blocking it.
+
+### Readahead: the prefetch engine
+
+`page_cache_sync_ra` at `mm/readahead.c:557` is where the heuristics live:
+
+```c
+void page_cache_sync_ra(struct readahead_control *ractl, unsigned long req_count)
+{
+    pgoff_t index = readahead_index(ractl);
+    struct file_ra_state *ra = ractl->ra;
+
+    // Detect sequential vs random access patterns:
+    //   prev_pos = last read position (per-file, in f_ra)
+    //   index    = current read position
+    prev_index = (unsigned long long)ra->prev_pos >> PAGE_SHIFT;
+
+    if (!index || req_count > max_pages || index - prev_index <= 1UL) {
+        // Start of file, oversized read, or sequential access:
+        // set up a fresh readahead window.
+        ra->start = index;
+        ra->size = get_init_ra_size(req_count, max_pages);
+        ra->async_size = ra->size > req_count ? ra->size - req_count
+                                              : ra->size >> 1;
+        goto readit;
+    }
+
+    // Not clearly sequential — check how much contiguous history we have
+    // in the page cache. If the walk behind the current index finds many
+    // cached pages, we are probably in a long-running sequential stream.
+    miss = page_cache_prev_miss(ractl->mapping, index - 1, max_pages);
+    contig_count = index - miss - 1;
+
+    if (contig_count <= req_count) {
+        // Looks random. Read just what was asked, no speculation.
+        do_page_cache_ra(ractl, req_count, 0);
+        return;
+    }
+
+    // Sustained sequential access — ramp up the window
+    ra->start = index;
+    ra->size = min(contig_count + req_count, max_pages);
+    ra->async_size = 1;
+readit:
+    page_cache_ra_order(ractl, ra);
+}
+```
+
+The kernel tracks per-file readahead state in `struct file_ra_state` (embedded in `struct file` as `f_ra`). It contains:
+- `ra_pages`: maximum window size (set from the backing device's advice, typically 128KB for UFS).
+- `start`, `size`: the current readahead window.
+- `async_size`: how many pages at the end of the window are "async" — when userspace hits them, kick off the next window.
+- `prev_pos`: the last read position, used to detect sequential access.
+
+The actual I/O submission happens in `page_cache_ra_unbounded` at `mm/readahead.c:211`:
+
+```c
+void page_cache_ra_unbounded(struct readahead_control *ractl,
+        unsigned long nr_to_read, unsigned long lookahead_size)
+{
+    // Tell memory reclaim we're in a filesystem operation.
+    // This prevents reclaim from recursing back into this filesystem
+    // (which could deadlock if the FS is writing back dirty pages).
+    unsigned int nofs = memalloc_nofs_save();
+
+    trace_page_cache_ra_unbounded(mapping->host, index, nr_to_read,
+                                  lookahead_size);
+
+    // Preallocate folios, one per page in the window
+    while (i < nr_to_read) {
+        struct folio *folio = xa_load(&mapping->i_pages, index + i);
+
+        if (folio && !xa_is_value(folio)) {
+            // This slot is already cached — submit what we have so far
+            // and continue with the next gap.
+            read_pages(ractl);
+            continue;
+        }
+
+        folio = ractl_alloc_folio(ractl, gfp_mask, ...);    // allocate
+        ret = filemap_add_folio(mapping, folio, index + i, gfp_mask);  // insert
+
+        if (i == mark)
+            folio_set_readahead(folio);   // this is the lookahead marker
+
+        ractl->_nr_pages += min_nrpages;
+        i += min_nrpages;
+    }
+
+    // Now submit I/O for the batch of newly-allocated folios
+    read_pages(ractl);
+    memalloc_nofs_restore(nofs);
+}
+```
+
+`read_pages` calls the filesystem's `a_ops->readahead` callback. For most filesystems, this is `mpage_readahead` at `fs/mpage.c`, which:
+
+1. Iterates the pre-allocated folios from the readahead control.
+2. For each folio, calls the filesystem's `get_block` to translate file offset → disk sector.
+3. Accumulates contiguous sectors into a single `bio`, extending it across folios when possible.
+4. Submits the bio via `mpage_bio_submit_read`:
+
+```c
+// fs/mpage.c:71
+static struct bio *mpage_bio_submit_read(struct bio *bio)
+{
+    bio->bi_end_io = mpage_read_end_io;   // completion callback
+    guard_bio_eod(bio);                    // clamp to device size
+    submit_bio(bio);
+    return NULL;
+}
+```
+
+The key point: **reads are asynchronous from the kernel's perspective**. `submit_bio` hands the bio to the block layer and returns. The reader (in `filemap_update_page`) then calls `folio_wait_locked` to sleep on the folio lock, which the block completion handler releases when the data arrives.
+
+### submit_bio: entering the block layer
+
+`submit_bio` at `block/blk-core.c:916` is the universal entry point:
+
+```c
+void submit_bio(struct bio *bio)
+{
+    if (bio_op(bio) == REQ_OP_READ) {
+        task_io_account_read(bio->bi_iter.bi_size);  // per-task I/O accounting
+        count_vm_events(PGPGIN, bio_sectors(bio));   // global vm stats
+    } else if (bio_op(bio) == REQ_OP_WRITE) {
+        count_vm_events(PGPGOUT, bio_sectors(bio));
+    }
+
+    bio_set_ioprio(bio);
+    submit_bio_noacct(bio);   // the real work
+}
+```
+
+Inside `submit_bio_noacct`, the block layer performs three critical operations:
+
+**1. Plug list insertion.** The kernel maintains a per-task plug list (`current->plug`) that batches I/O. When a task starts a bulk I/O operation, it calls `blk_start_plug` to begin batching; all `submit_bio` calls in between are added to the plug list. When the task calls `blk_finish_plug` (or sleeps), the whole batch is flushed to the block layer at once. This reduces the number of times we hit the queue lock.
+
+**2. Bio merging.** Before creating a new request, the block layer tries to merge the bio with pending requests:
+
+```c
+// block/blk-merge.c:944
+enum bio_merge_status bio_attempt_back_merge(struct request *req,
+                                              struct bio *bio,
+                                              unsigned int nr_segs)
+{
+    // Check: do the new bio's sectors immediately follow req's sectors?
+    if (req->biotail->bi_iter.bi_sector + bio_sectors(req->biotail)
+        != bio->bi_iter.bi_sector)
+        return BIO_MERGE_NONE;
+
+    // Chain the new bio onto the request
+    req->biotail->bi_next = bio;
+    req->biotail = bio;
+    req->__data_len += bio->bi_iter.bi_size;
+
+    // Notify QoS and I/O scheduler
+    blk_account_io_merge_bio(req);
+    return BIO_MERGE_OK;
+}
+```
+
+Front-merging is the mirror operation for the *start* of a request. Merging turns 100 small 4KB sequential writes into one 400KB write — fewer commands, fewer interrupts, and the hardware processes the contiguous region much more efficiently.
+
+**3. Request dispatch.** Once the bio is wrapped in a request (or merged into one), it goes to the I/O scheduler's per-hardware-queue list. When the hardware queue has capacity, `blk_mq_dispatch_rq_list` at `block/blk-mq.c:2116` hands requests to the driver via `q->mq_ops->queue_rq()`. This is where the `block_rq_issue` tracepoint fires. The driver programs the hardware (UFS, NVMe, etc.) and the hardware does the actual work.
+
+### The completion path: from hardware back to userspace
+
+When the hardware finishes, it raises an interrupt. The driver's interrupt handler calls `blk_mq_end_request`, which calls `bio_endio` at `block/bio.c:1749`:
+
+```c
+void bio_endio(struct bio *bio)
+{
+again:
+    if (!bio_remaining_done(bio))    // split bio — wait for all parts
+        return;
+    if (!bio_integrity_endio(bio))
+        return;
+
+    blk_zone_bio_endio(bio);
+    rq_qos_done_bio(bio);
+
+    if (bio->bi_bdev && bio_flagged(bio, BIO_TRACE_COMPLETION)) {
+        trace_block_bio_complete(bdev_get_queue(bio->bi_bdev), bio);
+    }
+
+    // Handle chained bios without blowing the stack
+    if (bio->bi_end_io == bio_chain_endio) {
+        bio = __bio_chain_endio(bio);
+        goto again;
+    }
+
+    if (bio->bi_end_io)
+        bio->bi_end_io(bio);    // filesystem's completion callback
+}
+```
+
+For a read, `bi_end_io` is `mpage_read_end_io` at `fs/mpage.c:46`:
+
+```c
+static void mpage_read_end_io(struct bio *bio)
+{
+    struct folio_iter fi;
+    int err = blk_status_to_errno(bio->bi_status);
+
+    bio_for_each_folio_all(fi, bio)
+        folio_end_read(fi.folio, err == 0);   // wake up waiters per folio
+
+    bio_put(bio);    // return bio to the pool
+}
+```
+
+And `folio_end_read` at `mm/filemap.c:1529` is what actually wakes the sleeping reader:
+
+```c
+void folio_end_read(struct folio *folio, bool success)
+{
+    unsigned long mask = 1 << PG_locked;
+
+    if (likely(success))
+        mask |= 1 << PG_uptodate;
+    // Atomically clear PG_locked and (if success) set PG_uptodate
+    // in a single operation. Check if anyone was waiting on PG_locked.
+    if (folio_xor_flags_has_waiters(folio, mask))
+        folio_wake_bit(folio, PG_locked);
+}
+```
+
+This is the handoff: the I/O is done, the page is up-to-date, and any task sleeping on `folio_wait_locked` for this page gets woken up. Control returns to the filemap read path, which copies the data to userspace with `copy_folio_to_iter`.
+
+### The write path
+
+Writeback is the mirror of the read path, but with different triggers. Dirty pages get written back from three sources:
+
+1. **Background writeback** (the `kworker/flush-*` thread) runs periodically based on `dirty_writeback_centisecs` (default 5 seconds) and picks up pages dirtier than `dirty_expire_centisecs` (default 30 seconds).
+2. **Explicit sync** — `fsync()`, `fdatasync()`, or `sync()` calls `filemap_write_and_wait_range` which immediately initiates writeback.
+3. **Memory pressure** — during reclaim, `shrink_folio_list` may call `pageout()` to write dirty anon pages to swap.
+
+All three paths converge at `do_writepages` in `mm/page-writeback.c:2564`:
+
+```c
+int do_writepages(struct address_space *mapping, struct writeback_control *wbc)
+{
+    if (wbc->nr_to_write <= 0)
+        return 0;
+    wb = inode_to_wb_wbc(mapping->host, wbc);
+    wb_bandwidth_estimate_start(wb);
+    while (1) {
+        if (mapping->a_ops->writepages)
+            ret = mapping->a_ops->writepages(mapping, wbc);   // the FS handler
+        else
+            ret = 0;
+        if (ret != -ENOMEM || wbc->sync_mode != WB_SYNC_ALL)
+            break;
+        // OOM during sync writeback — throttle and retry
+        reclaim_throttle(NODE_DATA(numa_node_id()),
+                         VMSCAN_THROTTLE_WRITEBACK);
+    }
+    return ret;
+}
+```
+
+The filesystem's `writepages` callback is the dual of `readahead`. For most filesystems it's `mpage_writepages`, which:
+
+1. Iterates dirty pages in the address_space using the `PAGECACHE_TAG_DIRTY` xarray mark (fast — no scanning clean pages).
+2. For each dirty page, looks up the disk sector via `get_block`.
+3. Accumulates contiguous sectors into a bio.
+4. Sets `PG_writeback` on the folio (so reclaim knows not to evict it).
+5. Submits the bio via `mpage_bio_submit_write`:
+
+```c
+// fs/mpage.c:79
+static struct bio *mpage_bio_submit_write(struct bio *bio)
+{
+    bio->bi_end_io = mpage_write_end_io;
+    guard_bio_eod(bio);
+    submit_bio(bio);
+    return NULL;
+}
+```
+
+When the write I/O completes, `mpage_write_end_io` at `fs/mpage.c:57` runs:
+
+```c
+static void mpage_write_end_io(struct bio *bio)
+{
+    struct folio_iter fi;
+    int err = blk_status_to_errno(bio->bi_status);
+
+    bio_for_each_folio_all(fi, bio) {
+        if (err)
+            mapping_set_error(fi.folio->mapping, err);  // propagate to fsync
+        folio_end_writeback(fi.folio);                  // clear PG_writeback
+    }
+    bio_put(bio);
+}
+```
+
+The `folio_end_writeback` call (Part 5 traced this at `mm/filemap.c:1681`) clears `PG_writeback` and wakes anyone sleeping in `folio_wait_writeback` — typically an `fsync()` caller waiting for their data to hit disk.
+
+### The full read/write cycle, visualized
+
+```
+READ PATH:
+  read(fd) syscall
+    → filemap_read              mm/filemap.c:2768
+      → filemap_get_pages       mm/filemap.c:2667
+        → filemap_get_read_batch    [cache lookup via xarray]
+        → page_cache_sync_ra    mm/readahead.c:557
+          → page_cache_ra_unbounded    [allocate folios, insert into cache]
+            → read_pages → mpage_readahead [build bio]
+              → mpage_bio_submit_read
+                → submit_bio        block/blk-core.c:916
+                  → submit_bio_noacct
+                    → [plug/merge/scheduler/dispatch]
+                      → driver queue_rq()  → [HARDWARE]
+
+  [HARDWARE INTERRUPT]
+    → driver IRQ handler
+      → blk_mq_end_request
+        → bio_endio               block/bio.c:1749
+          → mpage_read_end_io     fs/mpage.c:46
+            → folio_end_read      mm/filemap.c:1529
+              → folio_wake_bit(PG_locked)
+                [reader task wakes up]
+  → copy_folio_to_iter → userspace buffer
+
+WRITE PATH:
+  fsync(fd) syscall  (or writeback timer, or reclaim)
+    → filemap_write_and_wait_range  mm/filemap.c:675
+      → filemap_fdatawrite_range
+        → do_writepages           mm/page-writeback.c:2564
+          → a_ops->writepages → mpage_writepages
+            [iterate PAGECACHE_TAG_DIRTY, set PG_writeback]
+            → mpage_bio_submit_write
+              → submit_bio → [same block layer path as read]
+
+  [HARDWARE INTERRUPT]
+    → bio_endio → mpage_write_end_io  fs/mpage.c:57
+      → folio_end_writeback           mm/filemap.c:1681
+        → clear PG_writeback, wake fsync() waiters
+```
+
+### How this interacts with memory
+
+Two points are worth calling out for the tracer:
+
+**Reads allocate pages.** When the cache misses, readahead calls `filemap_add_folio`, which goes through the page allocator (`mm_page_alloc` tracepoint fires) and the page cache insertion path (`mm_filemap_add_to_page_cache` tracepoint fires). From the tracer's perspective, a cache-miss read produces the same allocation events as any other page. The difference is that the page starts life as the *destination* of a bio rather than being written to by userspace.
+
+**Writes do not allocate.** Writeback operates on pages that already exist in the page cache. It sets `PG_writeback` on an existing folio, submits a bio pointing to that folio's page(s), and clears `PG_writeback` on completion. No allocation happens. The tracer sees the page's EVT_DIRTY event earlier (when userspace wrote to it) and the EVT_WB_DONE event later (when the data hits disk).
+
+**The block_rq_issue/complete gap is hardware latency.** Between `block_rq_issue` and `block_rq_complete`, the page is sitting in a disk command queue, being processed by the flash translation layer, and finally being written to flash cells. For UFS on a phone, this is typically 100-500µs for writes. Spikes to 5-10ms mean the FTL is doing internal garbage collection or wear-leveling — often the biggest source of tail latency on Android.
+
+### Block layer tracepoints for the tracer
+
+```c
+// block/blk-mq.c:1372 — when a request is sent to the driver
 trace_block_rq_issue(rq);
 
-// block/blk-mq.c:891
-// When the hardware signals completion:
+// block/blk-mq.c:891/961 — when the driver reports completion
 trace_block_rq_complete(req, BLK_STS_OK, total_bytes);
 ```
 
-The gap between `block_rq_issue` and `block_rq_complete` is the actual hardware latency — the time the disk takes to do the work. For UFS (the flash storage on modern phones), writes typically take 100-500 microseconds. Spikes to 5-10ms indicate the flash translation layer is doing garbage collection internally.
+The challenge for our tracer: both tracepoints carry sector information (dev, sector, nr_sectors) but not PFN. To connect an I/O event back to a page, we need to record the (dev, sector) → page_id mapping *at bio construction time* (when we still have the folio). Part 12 shows exactly how.
 
 ---
 
@@ -845,6 +1227,59 @@ Finally, for clean, unmapped pages, the kernel removes them from the page cache 
 When a page is finally freed, it returns to the **buddy allocator** — the kernel's physical page allocator. The buddy system organizes free pages by powers of two: order-0 (4KB), order-1 (8KB), up to order-10 (4MB). When you free a 4KB page, the buddy allocator checks if its "buddy" (the adjacent 4KB page) is also free. If so, it merges them into an 8KB block, then checks if THAT block's buddy is free, and so on. This coalescing reduces fragmentation.
 
 Allocation works in reverse: if you ask for 4KB and the order-0 list is empty, the allocator splits an 8KB block (or 16KB, or 32KB...) until it has a 4KB chunk to give you.
+
+The actual free path is `__free_one_page` at `mm/page_alloc.c:978`:
+
+```c
+static inline void __free_one_page(struct page *page,
+        unsigned long pfn, struct zone *zone, unsigned int order,
+        int migratetype, fpi_t fpi_flags)
+{
+    unsigned long buddy_pfn = 0;
+    unsigned long combined_pfn;
+    struct page *buddy;
+
+    VM_BUG_ON_PAGE(pfn & ((1 << order) - 1), page);  // pfn must be order-aligned
+
+    account_freepages(zone, 1 << order, migratetype);
+
+    // Try to merge with buddies, moving up orders
+    while (order < MAX_PAGE_ORDER) {
+        int buddy_mt = migratetype;
+
+        // If compaction is capturing this page for a high-order allocation,
+        // hand it over and stop merging.
+        if (compaction_capture(capc, page, order, migratetype)) {
+            account_freepages(zone, -(1 << order), migratetype);
+            return;
+        }
+
+        // Find our buddy. The buddy is found by XOR-ing the PFN with
+        // (1 << order) — this flips the bit that distinguishes the two
+        // halves of a block at this order.
+        buddy = find_buddy_page_pfn(page, pfn, order, &buddy_pfn);
+        if (!buddy)
+            goto done_merging;          // buddy is in use, cannot merge
+
+        // Buddy is free — remove it from the freelist and merge
+        __del_page_from_free_list(buddy, zone, order, buddy_mt);
+
+        // The merged block starts at the lower of the two PFNs
+        combined_pfn = buddy_pfn & pfn;
+        page = page + (combined_pfn - pfn);
+        pfn = combined_pfn;
+        order++;
+    }
+
+done_merging:
+    set_buddy_order(page, order);
+    __add_to_free_list(page, zone, order, migratetype, to_tail);
+}
+```
+
+The buddy-finding trick is elegant. Two buddies at order `n` have PFNs that differ only in bit `n`: `0...0 XXXX 0 YYYY` and `0...0 XXXX 1 YYYY`, where `YYYY` has `n` bits. `find_buddy_page_pfn` computes `buddy_pfn = pfn ^ (1 << order)` to get the buddy, and the merged block's PFN is `pfn & buddy_pfn` (the lower of the two). No pointer chasing — just arithmetic.
+
+The tradeoff of the buddy system: you can get fragmentation. If the kernel has thousands of free order-0 pages scattered across memory but none of them have free buddies (because their buddies are in use), you cannot satisfy a request for an order-4 (64KB) allocation even though the total free memory is enough. This is why memory compaction exists — it physically moves pages around to create contiguous free regions.
 
 The GFP flags passed to allocation functions control what the allocator is allowed to do:
 
@@ -1079,118 +1514,435 @@ This pattern minimizes the time locks are held, which is critical for scalabilit
 
 ## Part 11: eBPF — Observing the Kernel From the Inside
 
-eBPF (extended Berkeley Packet Filter) lets you run small programs inside the kernel without modifying the kernel source or loading traditional kernel modules. Originally designed for network packet filtering, it has evolved into a general-purpose instrumentation framework.
+eBPF lets you run small programs inside the kernel, safely, without modifying the kernel source or loading traditional kernel modules. Originally designed as a packet filter in 1992, it has been rebuilt into a general-purpose instrumentation framework that powers tracing, networking, security, and scheduling on every modern Linux system.
 
-### How eBPF works
+This section explains what eBPF actually is at the implementation level — the instruction set, the interpreter, the JIT, the verifier, the helper call mechanism, and how a BPF program attaches to a tracepoint. Everything is grounded in actual kernel code.
 
-An eBPF program is:
-1. Written in restricted C (no loops that the verifier cannot prove terminate, no unbounded memory access).
-2. Compiled to eBPF bytecode using clang.
-3. Loaded into the kernel via the `bpf()` syscall.
-4. **Verified** by the kernel's BPF verifier before execution.
-5. JIT-compiled to native machine code (ARM64, x86).
-6. Attached to a hook point (tracepoint, kprobe, etc.).
+### The brief history
 
-The verifier at `kernel/bpf/verifier.c` is the safety net. From its own comment (line 56):
+**BPF (1992).** Steven McCanne and Van Jacobson at LBL designed the Berkeley Packet Filter for `tcpdump`. It was a tiny register machine — two 32-bit registers (A and X), a scratch memory area, ~20 instructions — interpreted by the kernel for each packet. The innovation was *safety through simplicity*: the instruction set was so restricted that the kernel could verify the program in linear time, and because it had no loops and no memory access outside a fixed scratch area, it could not crash or hang the kernel.
 
-> *"bpf_check() is a static code analyzer that walks eBPF program instruction by instruction and updates register/stack state. All paths of conditional branches are analyzed until 'bpf_exit' insn."*
+**Linux adopts it (1997).** Linux added BPF to socket filters. For the next 15 years, it stayed mostly as-is — a niche tool for packet filters.
 
-It performs two passes:
+**eBPF (2014, kernel 3.18).** Alexei Starovoitov rewrote BPF for the modern era. The new instruction set looked much more like a real CPU: ten 64-bit registers, a 512-byte stack, calls to kernel helper functions, and a more sophisticated verifier. Crucially, the architecture mirrored x86-64 register conventions so BPF code could be JIT-compiled to native instructions with minimal overhead.
 
-1. **First pass**: Depth-first search to confirm the program is a DAG (Directed Acyclic Graph). Rejects programs with loops, unreachable instructions, or out-of-bounds jumps.
-2. **Second pass**: Simulates all execution paths, tracking the **type** of every register. If R1 holds a `PTR_TO_MAP_VALUE`, the verifier knows you can dereference it within the map value's size. If R1 holds a `SCALAR_VALUE`, dereferencing it is rejected.
+**The tracing wave (2015–2018).** Brendan Gregg and others realized eBPF was the right tool for Linux tracing. The `bcc` toolkit and later `bpftrace` made it practical. Kernel developers added tracepoint attachment, kprobes, and uprobes. The BPF helper library grew to hundreds of functions.
 
-This means eBPF programs cannot crash the kernel, cannot access arbitrary memory, and always terminate. The tradeoff is that some legal programs are rejected because the verifier cannot prove they are safe — you sometimes need to restructure code to help the verifier along.
+**BTF and CO-RE (2019, kernel 5.4).** Andrii Nakryiko added BPF Type Format — debug information embedded in the kernel image. With BTF, a BPF program compiled against one kernel can run on a different kernel, with libbpf relocating struct field offsets at load time. This is what made BPF programs portable across distributions and versions.
 
-### BPF maps: sharing data between kernel and userspace
+**Today (kernel 6.x).** eBPF is everywhere: Cilium for networking, Tetragon for security, parca for profiling, Android's `netd`. The verifier has grown from ~1,000 lines to ~20,000 lines, the instruction set has gained bounded loops, function calls, spin locks, ring buffers, and dynamic pointers. You can write a scheduler in eBPF now (`sched_ext`).
 
-Maps are the primary data structure. They are kernel-managed key-value stores that both BPF programs and userspace can read and write.
+### The instruction format
 
-The most common types:
-
-| Map type | Description | Use case |
-|---|---|---|
-| `BPF_MAP_TYPE_HASH` | Hash table | General key-value lookup |
-| `BPF_MAP_TYPE_ARRAY` | Fixed-size array (key is u32 index) | Configuration, counters |
-| `BPF_MAP_TYPE_RINGBUF` | Lock-free ring buffer | High-throughput event streaming to userspace |
-| `BPF_MAP_TYPE_PERCPU_HASH` | Per-CPU hash table | Counters without atomic contention |
-| `BPF_MAP_TYPE_LRU_HASH` | Hash with automatic LRU eviction | Caches with bounded size |
-
-Hash maps are implemented in `kernel/bpf/hashtab.c`. Lookups compute a hash using jhash, index into a bucket array, and walk a linked list. Updates acquire a per-bucket spinlock. The implementation supports both pre-allocated (no allocation at update time, important for use in NMI context) and dynamically-allocated modes.
-
-Ring buffers (`kernel/bpf/ringbuf.c`) are the high-performance choice for streaming events to userspace. They use a multi-producer (multiple BPF programs can write), single-consumer (one userspace thread reads) design with lock-free atomic operations. The buffer pages are double-mapped in kernel virtual memory so that writes that wrap around the end of the buffer appear contiguous — no special wrapping logic needed.
-
-### Attaching to tracepoints
-
-Tracepoints are static instrumentation points compiled into the kernel. They have zero overhead when disabled (the compiler turns them into NOPs using static keys/branches). When a BPF program attaches, the tracepoint becomes active and calls the BPF program on every hit.
-
-A tracepoint definition (from `include/trace/events/kmem.h:180`):
+At the heart of eBPF is `struct bpf_insn` at `include/uapi/linux/bpf.h:80`:
 
 ```c
-TRACE_EVENT(mm_page_alloc,
-    TP_PROTO(struct page *page, unsigned int order,
-             gfp_t gfp_flags, int migratetype),
-
-    TP_STRUCT__entry(
-        __field(unsigned long, pfn)
-        __field(unsigned int, order)
-        __field(unsigned long, gfp_flags)
-        __field(int, migratetype)
-    ),
-
-    TP_fast_assign(
-        __entry->pfn       = page ? page_to_pfn(page) : -1UL;
-        __entry->order     = order;
-        __entry->gfp_flags = (__force unsigned long)gfp_flags;
-        __entry->migratetype = migratetype;
-    ),
-    // ...
-);
+struct bpf_insn {
+    __u8    code;       /* opcode */
+    __u8    dst_reg:4;  /* dest register */
+    __u8    src_reg:4;  /* source register */
+    __s16   off;        /* signed offset */
+    __s32   imm;        /* signed immediate constant */
+};
 ```
 
-The `TP_STRUCT__entry` defines what data is available to BPF programs. The `TP_fast_assign` block runs at the tracepoint callsite and fills in the data. From BPF, you access these fields via the context pointer:
+Every eBPF instruction is exactly 8 bytes. An 8-bit opcode, two 4-bit register fields (you have 11 registers, so 4 bits is enough), a 16-bit signed offset, and a 32-bit signed immediate. This fixed width is what makes the verifier and JIT simple — there is no decoding ambiguity.
+
+The opcode encodes three things:
+- **Class** (low 3 bits): BPF_ALU64, BPF_ALU, BPF_JMP, BPF_JMP32, BPF_LD, BPF_LDX, BPF_ST, BPF_STX.
+- **Operation** (high 4 bits): BPF_ADD, BPF_SUB, BPF_MOV, BPF_JEQ, BPF_JGT, BPF_CALL, etc.
+- **Source mode** (bit 3): BPF_K (immediate) or BPF_X (register).
+
+So `BPF_ALU64 | BPF_ADD | BPF_X` means "64-bit integer add, register-to-register." `BPF_ALU64 | BPF_MOV | BPF_K` means "64-bit integer move immediate."
+
+There are 11 registers (`MAX_BPF_REG` = 11):
+- **R0**: return value from helper calls and the program itself.
+- **R1-R5**: argument registers for helper calls.
+- **R6-R9**: callee-saved registers (preserved across helper calls).
+- **R10**: the frame pointer — read-only, points to the 512-byte stack.
+
+This calling convention deliberately matches x86-64. When a BPF program calls a kernel helper, the JIT translates the BPF call to a native `call` instruction, and R1-R5 map directly to the x86 argument registers. No shuffling required.
+
+### The interpreter
+
+Every eBPF program can either be interpreted or JIT-compiled. On most architectures (x86, arm64, arm, mips, riscv, s390x, power), JIT is the default — the interpreter exists as a fallback and for architectures without JIT support. The interpreter is `___bpf_prog_run` at `kernel/bpf/core.c:1775`. It uses a **computed-goto dispatch** that is faster than a switch statement:
 
 ```c
-SEC("tracepoint/kmem/mm_page_alloc")
-int my_handler(struct trace_event_raw_mm_page_alloc *ctx) {
-    unsigned long pfn = ctx->pfn;
-    unsigned int order = ctx->order;
+static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn)
+{
+    static const void * const jumptable[256] __annotate_jump_table = {
+        [0 ... 255] = &&default_label,
+        /* Now overwrite non-defaults ... */
+        BPF_INSN_MAP(BPF_INSN_2_LBL, BPF_INSN_3_LBL),
+        [BPF_JMP | BPF_CALL_ARGS] = &&JMP_CALL_ARGS,
+        [BPF_JMP | BPF_TAIL_CALL] = &&JMP_TAIL_CALL,
+        [BPF_ST  | BPF_NOSPEC]    = &&ST_NOSPEC,
+        [BPF_LDX | BPF_PROBE_MEM | BPF_B] = &&LDX_PROBE_MEM_B,
+        // ...
+    };
+
+#define CONT     ({ insn++; goto select_insn; })
+#define CONT_JMP ({ insn++; goto select_insn; })
+
+select_insn:
+    goto *jumptable[insn->code];
+
+    /* ALU (rest) */
+#define ALU(OPCODE, OP)                                 \
+    ALU64_##OPCODE##_X:                                 \
+        DST = DST OP SRC;                               \
+        CONT;                                           \
+    ALU_##OPCODE##_X:                                   \
+        DST = (u32) DST OP (u32) SRC;                   \
+        CONT;                                           \
+    ALU64_##OPCODE##_K:                                 \
+        DST = DST OP IMM;                               \
+        CONT;                                           \
+    ALU_##OPCODE##_K:                                   \
+        DST = (u32) DST OP (u32) IMM;                   \
+        CONT;
+    ALU(ADD,  +)
+    ALU(SUB,  -)
+    ALU(AND,  &)
+    ALU(OR,   |)
+    ALU(XOR,  ^)
+    ALU(MUL,  *)
     // ...
+```
+
+The GCC "labels as values" extension (`&&label`) lets the jumptable hold pointers to C labels directly. `goto *jumptable[insn->code]` jumps to the appropriate handler based on the opcode. Each handler ends with `CONT`, which advances the instruction pointer and dispatches the next instruction — no loop overhead, the CPU's branch predictor sees each site as an independent indirect jump and learns the common transitions.
+
+The `ALU` macro is a neat trick: each arithmetic opcode is just `DST = DST OP SRC` or `DST = DST OP IMM`, with 32-bit vs 64-bit variants. The whole integer ALU is a few dozen lines.
+
+### The JIT
+
+On a tracing kernel, you almost never run the interpreter. The JIT at `arch/arm64/net/bpf_jit_comp.c` (on ARM64) translates each BPF instruction to one or a few native instructions. For example, BPF `BPF_ALU64 | BPF_ADD | BPF_X` (add reg-to-reg, 64-bit) becomes a single ARM64 `add x{dst}, x{dst}, x{src}` instruction. The JIT emits native code into a writable-then-readonly kernel memory region, and calling the program is a simple function call.
+
+Because BPF uses the same register conventions as the host ABI, helper calls translate directly. When the JIT sees `BPF_JMP | BPF_CALL` with an immediate that identifies a helper, it emits a native `bl` (branch-and-link) to the helper function's address. R1-R5 are already in the correct ARM64 argument registers, R0 receives the return value — no marshalling code needed.
+
+### The verifier
+
+The verifier is the reason eBPF is safe. From the top-of-file comment at `kernel/bpf/verifier.c:56`:
+
+> *"bpf_check() is a static code analyzer that walks eBPF program instruction by instruction and updates register/stack state. All paths of conditional branches are analyzed until 'bpf_exit' insn. The first pass is depth-first-search to check that the program is a DAG. The second pass is all possible path descent from the 1st insn."*
+
+Two passes:
+
+**Pass 1: DAG check.** Depth-first search over the control flow graph. Rejects:
+- Programs larger than `BPF_MAXINSNS` (1M instructions).
+- Loops (back-edges) — unless they are bounded loops that the verifier can unroll.
+- Unreachable instructions.
+- Out-of-bounds or malformed jumps.
+
+**Pass 2: state simulation.** This is where most of the verifier's complexity lives. The verifier walks every path through the program, tracking the *type* of every register at every point. Types include:
+
+- `SCALAR_VALUE`: a non-pointer integer.
+- `PTR_TO_CTX`: pointer to the program's context (e.g., the tracepoint struct).
+- `PTR_TO_MAP_VALUE`: pointer returned by `bpf_map_lookup_elem`, valid for the map's value size.
+- `PTR_TO_MAP_VALUE_OR_NULL`: same, but might be NULL — must be null-checked before use.
+- `PTR_TO_STACK`: pointer into the program's 512-byte stack.
+- `PTR_TO_PACKET`: for XDP/socket filter programs, pointer into packet data.
+
+The verifier rejects any memory access whose pointer type and offset cannot be proven safe. The core check is in `check_mem_access` at `kernel/bpf/verifier.c:7702`. Before a load or store, this function checks:
+- The base register has a valid pointer type.
+- The offset is within the known bounds for that type.
+- For map values, the access is within `map->value_size`.
+- For packet pointers, the program has verified `end - start >= access_offset + size`.
+
+**The NULL check enforcement.** When you call `bpf_map_lookup_elem`, the verifier assigns the return value type `PTR_TO_MAP_VALUE_OR_NULL`. Any dereference is rejected until you do `if (ptr)`. After the comparison, the verifier knows one branch has `PTR_TO_MAP_VALUE` (dereferenceable) and the other has a scalar 0 (not dereferenceable). This is why you see `if (!ptr) return 0;` everywhere in BPF code — it's not defensive programming, it's a verifier requirement.
+
+The downside: the verifier is conservative. Programs it cannot prove safe are rejected, even if a human can tell they are safe. You sometimes have to rewrite code to help the verifier along — bounded loops with obvious upper bounds, explicit range checks, helper functions that give the verifier more information.
+
+### The bpf() syscall
+
+Userspace loads programs, creates maps, and attaches programs via one syscall. `SYSCALL_DEFINE3(bpf, ...)` at `kernel/bpf/syscall.c:6360`:
+
+```c
+SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
+{
+    return __sys_bpf(cmd, USER_BPFPTR(uattr), size);
 }
 ```
+
+The `cmd` argument determines what the syscall does:
+- `BPF_MAP_CREATE`: create a map. `__sys_bpf` calls `map_create` at line 1369.
+- `BPF_MAP_LOOKUP_ELEM`, `BPF_MAP_UPDATE_ELEM`, `BPF_MAP_DELETE_ELEM`: manipulate map entries from userspace.
+- `BPF_PROG_LOAD`: load a program. Calls `bpf_prog_load` at line 2871, which runs the verifier and optionally JITs the program.
+- `BPF_PROG_ATTACH`, `BPF_LINK_CREATE`: attach a loaded program to a hook.
+- `BPF_RAW_TRACEPOINT_OPEN`: attach specifically to a raw tracepoint.
+
+Each successful operation returns a file descriptor. The map fd and program fd are what tie everything together — when a BPF program references a map, it references it by fd (the verifier converts the fd to an internal pointer during load).
+
+### Helpers: how BPF programs call into the kernel
+
+BPF programs cannot directly call arbitrary kernel functions — that would be unsafe. Instead, they call a curated set of **helpers**. Each helper has a numeric ID, a C implementation, and a type signature that the verifier uses to check arguments.
+
+Here is `bpf_map_lookup_elem` at `kernel/bpf/helpers.c:44`:
+
+```c
+BPF_CALL_2(bpf_map_lookup_elem, struct bpf_map *, map, void *, key)
+{
+    WARN_ON_ONCE(!bpf_rcu_lock_held());
+    return (unsigned long) map->ops->map_lookup_elem(map, key);
+}
+
+const struct bpf_func_proto bpf_map_lookup_elem_proto = {
+    .func       = bpf_map_lookup_elem,
+    .gpl_only   = false,
+    .pkt_access = true,
+    .ret_type   = RET_PTR_TO_MAP_VALUE_OR_NULL,
+    .arg1_type  = ARG_CONST_MAP_PTR,
+    .arg2_type  = ARG_PTR_TO_MAP_KEY,
+};
+```
+
+The `BPF_CALL_2` macro generates the actual function plus a wrapper that reads arguments from registers. The `bpf_func_proto` is the verifier's type signature:
+- `ret_type = RET_PTR_TO_MAP_VALUE_OR_NULL`: the verifier will mark R0 as nullable after this call.
+- `arg1_type = ARG_CONST_MAP_PTR`: the first argument must be a constant pointer to a map (the verifier tracks which map, so it knows the value size).
+- `arg2_type = ARG_PTR_TO_MAP_KEY`: the second argument must be a pointer to stack memory sized at least `map->key_size`.
+
+Another example — `bpf_ktime_get_ns` at `kernel/bpf/helpers.c:178`:
+
+```c
+BPF_CALL_0(bpf_ktime_get_ns)
+{
+    /* NMI safe access to clock monotonic */
+    return ktime_get_mono_fast_ns();
+}
+```
+
+Takes no arguments, returns a timestamp in nanoseconds. The `ktime_get_mono_fast_ns` variant is NMI-safe, which matters because BPF programs can run from any context, including NMI handlers.
+
+And `bpf_get_smp_processor_id` at `kernel/bpf/helpers.c:155`:
+
+```c
+BPF_CALL_0(bpf_get_smp_processor_id)
+{
+    return smp_processor_id();
+}
+```
+
+When a BPF program calls a helper, the JIT emits a native call to the wrapper function. R1-R5 are already in ARM64/x86 argument registers due to the matched calling convention, so the call costs roughly the same as a regular kernel function call.
+
+### Hash maps
+
+The hash map implementation is at `kernel/bpf/hashtab.c`. A map is an array of buckets (sized as the next power of 2 above `max_entries`), each protected by a raw spinlock. Lookup:
+
+```c
+// Simplified from __htab_map_lookup_elem at kernel/bpf/hashtab.c:732
+static struct htab_elem *__htab_map_lookup_elem(struct bpf_map *map, void *key)
+{
+    struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+    struct hlist_nulls_head *head;
+    struct htab_elem *l;
+    u32 hash, key_size;
+
+    key_size = map->key_size;
+    hash = htab_map_hash(key, key_size, htab->hashrnd);  // jhash
+    head = select_bucket(htab, hash);
+
+    l = lookup_nulls_elem_raw(head, hash, key, key_size, htab->n_buckets);
+    return l;
+}
+```
+
+jhash is the Jenkins hash — fast and has good distribution for small keys. `htab->hashrnd` is a per-map random seed, set at map creation, that prevents hash-collision attacks.
+
+The `hlist_nulls_head` is a special linked list where the terminator encodes the bucket index. This lets RCU readers detect if they've walked off the end of a bucket (which can happen during concurrent updates) without taking a lock.
+
+Updates (`htab_map_update_elem` at line 1167) acquire the bucket's spinlock, find an existing element with the matching key or allocate a new one, and insert it. For pre-allocated maps (the default), there's no allocation at update time — elements come from a pre-sized pool, which is what makes these maps usable from NMI context.
+
+### Ring buffer internals
+
+For high-throughput event streaming, the ring buffer is the right tool. Its reservation path at `kernel/bpf/ringbuf.c:463`:
+
+```c
+static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
+{
+    unsigned long cons_pos, prod_pos, new_prod_pos, pend_pos, over_pos, flags;
+    struct bpf_ringbuf_hdr *hdr;
+    u32 len, pg_off, hdr_len;
+
+    if (unlikely(size > RINGBUF_MAX_RECORD_SZ))
+        return NULL;
+
+    len = round_up(size + BPF_RINGBUF_HDR_SZ, 8);   // 8-byte alignment
+    if (len > ringbuf_total_data_sz(rb))
+        return NULL;
+
+    cons_pos = smp_load_acquire(&rb->consumer_pos);  // pairs with userspace store
+
+    if (raw_res_spin_lock_irqsave(&rb->spinlock, flags))
+        return NULL;
+
+    // Advance pending_pos past any records that are no longer busy
+    pend_pos = rb->pending_pos;
+    prod_pos = rb->producer_pos;
+    new_prod_pos = prod_pos + len;
+
+    while (pend_pos < prod_pos) {
+        hdr = (void *)rb->data + (pend_pos & rb->mask);
+        hdr_len = READ_ONCE(hdr->len);
+        if (hdr_len & BPF_RINGBUF_BUSY_BIT)
+            break;                       // a producer is still writing here
+        pend_pos += bpf_ringbuf_round_up_hdr_len(hdr_len);
+    }
+    rb->pending_pos = pend_pos;
+
+    if (!bpf_ringbuf_has_space(rb, new_prod_pos, cons_pos, pend_pos)) {
+        raw_res_spin_unlock_irqrestore(&rb->spinlock, flags);
+        return NULL;                     // buffer full
+    }
+
+    // Carve out our slot
+    hdr = (void *)rb->data + (prod_pos & rb->mask);
+    hdr->len = size | BPF_RINGBUF_BUSY_BIT;     // mark busy so consumers skip
+    hdr->pg_off = bpf_ringbuf_rec_pg_off(rb, hdr);
+
+    // Advance producer_pos BEFORE releasing the spinlock
+    smp_store_release(&rb->producer_pos, new_prod_pos);
+    raw_res_spin_unlock_irqrestore(&rb->spinlock, flags);
+
+    return (void *)hdr + BPF_RINGBUF_HDR_SZ;
+}
+```
+
+A few things to notice:
+
+**The busy bit.** Each record's header has a `BPF_RINGBUF_BUSY_BIT`. When a producer reserves a slot, the bit is set. The consumer on userspace sees the bit and knows the record is not yet committed — it stops reading at that point even though the producer_pos has advanced. This lets multiple producers write concurrently without corrupting the consumer's view.
+
+**The memory barriers.** `smp_store_release` and `smp_load_acquire` are the critical synchronization primitives. The release-acquire pair ensures that when the consumer loads `producer_pos` and sees it has advanced, all the writes the producer did before `smp_store_release` are visible. Without this, the consumer could see an updated position but stale data.
+
+**Submission.** When the producer finishes writing, it calls `bpf_ringbuf_submit` which clears the busy bit:
+
+```c
+// kernel/bpf/ringbuf.c:559
+static void bpf_ringbuf_commit(void *sample, u64 flags, bool discard)
+{
+    hdr = sample - BPF_RINGBUF_HDR_SZ;
+    rb = bpf_ringbuf_restore_from_rec(hdr);
+    new_len = hdr->len ^ BPF_RINGBUF_BUSY_BIT;   // clear busy bit atomically
+
+    xchg(&hdr->len, new_len);  // atomic xchg = full barrier + store
+
+    // Wake userspace if the consumer has caught up to this slot
+    rec_pos = (void *)hdr - (void *)rb->data;
+    cons_pos = smp_load_acquire(&rb->consumer_pos) & rb->mask;
+
+    if (flags & BPF_RB_FORCE_WAKEUP)
+        irq_work_queue(&rb->work);
+    else if (cons_pos == rec_pos && !(flags & BPF_RB_NO_WAKEUP))
+        irq_work_queue(&rb->work);    // wake via softirq context
+}
+```
+
+The wakeup uses `irq_work_queue` instead of a direct wakeup because BPF programs can run in hard IRQ context where you cannot safely touch scheduler locks. `irq_work_queue` defers the wakeup to softirq context.
+
+**Userspace mmap.** The magic that lets userspace read the ring buffer efficiently: the buffer's data pages are **double-mapped** in kernel virtual memory. A write near the end of the buffer that logically wraps to the beginning is, in kernel virtual address space, just a linear write — the second mapping sits immediately after the first. This means the producer never has to handle wraparound specially. Userspace mmaps the consumer and producer position pages plus the data pages and reads entries in order.
+
+### Attaching a BPF program to a tracepoint
+
+Tracepoints are static instrumentation points compiled into the kernel. They are implemented with "static keys" — branches that the compiler turns into NOPs when disabled and into real calls when enabled. The disabled cost is zero; the enabled cost is one indirect call plus the program's runtime.
+
+When you load a BPF program and attach it to a tracepoint (via `BPF_RAW_TRACEPOINT_OPEN` or `BPF_LINK_CREATE`), the kernel adds your program to a `prog_array` attached to the tracepoint. When the tracepoint fires, it calls `trace_call_bpf` at `kernel/trace/bpf_trace.c:109`:
+
+```c
+unsigned int trace_call_bpf(struct trace_event_call *call, void *ctx)
+{
+    unsigned int ret;
+
+    cant_sleep();    // tracepoints run in contexts where you cannot sleep
+
+    // Recursion guard: only allow one BPF program per CPU at a time.
+    // Otherwise a BPF program that (indirectly) triggers another tracepoint
+    // could infinitely recurse and blow the stack.
+    if (unlikely(__this_cpu_inc_return(bpf_prog_active) != 1)) {
+        rcu_read_lock();
+        bpf_prog_inc_misses_counters(rcu_dereference(call->prog_array));
+        rcu_read_unlock();
+        ret = 0;
+        goto out;
+    }
+
+    rcu_read_lock();
+    ret = bpf_prog_run_array(rcu_dereference(call->prog_array),
+                             ctx, bpf_prog_run);
+    rcu_read_unlock();
+
+ out:
+    __this_cpu_dec(bpf_prog_active);
+    return ret;
+}
+```
+
+Three things here are worth understanding:
+
+**The recursion guard (`bpf_prog_active`).** If a BPF program allocates memory (triggering `mm_page_alloc`) or takes a lock that fires a tracepoint, you could recurse into `trace_call_bpf` from inside a BPF program. The per-CPU counter prevents this — if we are already inside a BPF program on this CPU, the inner tracepoint fires but finds the counter nonzero and skips program execution. This is why you sometimes see "missed events" in BPF stats; usually this is the culprit.
+
+**RCU for program lookup.** `call->prog_array` is the list of attached programs. It is modified only during attach/detach operations and read on every tracepoint hit. RCU is the natural fit: readers take a cheap `rcu_read_lock`; writers copy-and-replace the array and wait for a grace period before freeing the old one.
+
+**`cant_sleep()`** is an assertion that catches bugs — tracepoints fire in atomic context (preemption disabled, IRQs possibly disabled), so no helper a BPF program calls can ever sleep.
 
 ### Kprobes: hooking any kernel function
 
-Tracepoints are stable and efficient, but they only exist where kernel developers placed them. **Kprobes** let you hook any kernel function by dynamically patching the instruction at the function's entry point:
+Tracepoints exist only where kernel developers placed them. Kprobes let you hook any kernel function dynamically. When you attach a kprobe to `filemap_dirty_folio`, the kernel:
+
+1. Makes a private copy of the first instruction(s) of `filemap_dirty_folio`.
+2. Replaces the first instruction with a `brk` (ARM64) or `int3` (x86) breakpoint.
+3. When the CPU hits that breakpoint, it traps into the kprobe handler, which calls your BPF program with `struct pt_regs *` pointing to the current register state.
+4. After your BPF program returns, the kernel emulates the original instruction and resumes the target function.
+
+The cost is higher than a tracepoint — a breakpoint trap is ~200-500ns versus ~50ns for a tracepoint — but you can hook anywhere. For a few functions per second, this is fine. For hot paths, prefer a tracepoint.
+
+From BPF, kprobe arguments come via `struct pt_regs`:
 
 ```c
-SEC("kprobe/folio_mark_dirty")
+SEC("kprobe/filemap_dirty_folio")
 int on_dirty(struct pt_regs *ctx) {
-    struct folio *folio = (struct folio *)PT_REGS_PARM1(ctx);
-    // read fields from folio using bpf_probe_read_kernel()
+    // filemap_dirty_folio(mapping, folio) — args are in x0, x1 on ARM64
+    struct address_space *mapping = (struct address_space *)PT_REGS_PARM1(ctx);
+    struct folio *folio = (struct folio *)PT_REGS_PARM2(ctx);
+    // ...
 }
 ```
 
-The tradeoff: kprobes are less stable (function signatures and internal names change between kernel versions), slightly slower (they use interrupts/breakpoints), and the arguments are raw register values (you need to know the calling convention). Use tracepoints when available; kprobes when no tracepoint exists.
+The `PT_REGS_PARM*` macros abstract over architecture-specific register layouts.
 
-### BTF and CO-RE: writing portable BPF programs
+### BTF and CO-RE: compile once, run everywhere
 
-**BTF** (BPF Type Format) is type information embedded in the kernel image. It describes every struct, every field offset, every function signature. With BTF, a BPF program compiled on one kernel version can run on another — the BPF loader uses BTF to **relocate** struct field accesses at load time.
+A big problem with early eBPF tracing was portability. A program compiled against kernel 5.4 hardcoded offsets like `offsetof(struct folio, mapping) = 24`. On kernel 5.10, where the struct layout had changed, the program read the wrong memory.
 
-This is called **CO-RE** (Compile Once, Run Everywhere). Instead of hardcoding `offsetof(struct folio, mapping) = 24`, the BPF program records "I want the `mapping` field of `struct folio`" and libbpf patches the offset at load time based on the running kernel's BTF.
+**BTF** (BPF Type Format) is debug information embedded in the kernel image at `/sys/kernel/btf/vmlinux`. It describes every struct, every field offset, every function signature. With BTF, the BPF loader can **relocate** field accesses at load time — your program says "give me the `mapping` field of `struct folio`," and the loader patches in the correct offset for the running kernel.
 
-You enable this by compiling against a `vmlinux.h` header generated from the kernel's BTF:
+This is **CO-RE** (Compile Once, Run Everywhere). In practice, you generate a header from the running kernel's BTF:
 
 ```bash
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
 ```
 
-And using `BPF_CORE_READ` macros:
+And you use `BPF_CORE_READ` macros that emit relocatable accesses:
 
 ```c
 struct address_space *mapping = BPF_CORE_READ(folio, mapping);
 unsigned long ino = BPF_CORE_READ(folio, mapping, host, i_ino);
 ```
+
+Under the hood, `BPF_CORE_READ` expands to a load instruction with a special relocation record. At load time, libbpf reads the kernel's BTF, finds the struct and field, and patches the instruction's immediate operand with the correct offset. This is how the same BPF binary can run on kernel 5.4 and 6.12 unchanged.
+
+### Putting it all together
+
+A BPF program attached to a tracepoint runs this path on every event:
+
+1. Kernel code reaches `trace_mm_page_alloc(page, order, ...)`.
+2. The tracepoint's static key is enabled, so the call goes through.
+3. `trace_call_bpf` is invoked with the tracepoint's `ctx` (the event struct).
+4. Per-CPU recursion guard is checked and incremented.
+5. Under `rcu_read_lock`, the list of attached BPF programs is walked.
+6. For each program: jump to the JIT-compiled native code (or the interpreter).
+7. The BPF program reads fields from `ctx`, calls helpers (`bpf_map_lookup_elem`, `bpf_ringbuf_reserve`, `bpf_ktime_get_ns`), writes output.
+8. Return from the program. Guard is decremented. Tracepoint returns.
+
+End-to-end, a well-written BPF handler on a hot tracepoint adds 100-500ns of overhead per event. That is the price of observing what the kernel is doing, from inside.
 
 ---
 
@@ -1291,6 +2043,8 @@ enum event_type {
     EVT_COW          = 11,
     EVT_MIGRATE      = 12,
     EVT_ZRAM_COMPRESS = 13,
+    EVT_READ         = 14,   // bio carrying read for this page was built
+    EVT_READ_DONE    = 15,   // folio_end_read fired — data is in the page
 };
 
 struct page_event {
@@ -1326,10 +2080,11 @@ struct page_event {
             u64 new_pfn;
             u32 reason;           // MR_COMPACTION, MR_NUMA_MISPLACED, etc.
         } migrate;
-        struct {                  // EVT_IO_ISSUE, EVT_IO_COMPLETE
+        struct {                  // EVT_IO_ISSUE, EVT_IO_COMPLETE, EVT_READ, EVT_READ_DONE, EVT_WRITEBACK
             u64 sector;
             u64 dev;
             u32 nr_sectors;
+            u32 error;            // 0 = success, nonzero = I/O error
         } io;
         struct {                  // EVT_ZRAM_COMPRESS
             u32 compressed_size;
@@ -1406,6 +2161,68 @@ static __always_inline struct page_event *emit(u64 page_id, u64 pfn,
     e->order = order;
 
     return e;  // caller fills in the union, then calls bpf_ringbuf_submit(e, 0)
+}
+```
+
+### Helper: getting a PFN from a folio pointer
+
+Several kprobe handlers need the PFN of a folio given only a `struct folio *`. This is not as simple as it sounds, because BPF programs cannot directly do the pointer arithmetic that `page_to_pfn` does in kernel C. Here is the concrete implementation.
+
+The kernel macro `page_to_pfn(page)` boils down to `((page) - vmemmap)` — the page's offset in the global `vmemmap` array. On ARM64 with `CONFIG_SPARSEMEM_VMEMMAP=y` (the default), `vmemmap` is a fixed virtual address: `VMEMMAP_START`.
+
+From BPF, the approach is:
+
+1. At program init, userspace reads `/proc/kallsyms` to get the value of `vmemmap_base` (or the architecture's equivalent — on ARM64 there's no runtime symbol, but the address is constant and can be computed from `/proc/iomem` or hardcoded for the target).
+2. Userspace stores this value in a BPF array map.
+3. BPF handlers read `vmemmap` from the map and compute the PFN by subtraction.
+
+```c
+// Configuration map written by userspace at init
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u64);
+} vmemmap_base_map SEC(".maps");
+
+static __always_inline u64 folio_to_pfn_helper(struct folio *folio) {
+    u32 zero = 0;
+    u64 *vmemmap = bpf_map_lookup_elem(&vmemmap_base_map, &zero);
+    if (!vmemmap || !*vmemmap) return 0;
+
+    // folio and page share the same address (folio IS a page), so
+    // the PFN is simply (folio - vmemmap) / sizeof(struct page).
+    // Since struct page is a known size from BTF, we can compute this.
+    u64 folio_addr = (u64)folio;
+    if (folio_addr < *vmemmap) return 0;
+
+    return (folio_addr - *vmemmap) / sizeof(struct page);
+}
+```
+
+On a running kernel, userspace initializes the map like this:
+
+```c
+// Read vmemmap_base from /proc/kallsyms (requires CAP_SYSLOG) or
+// compute from a known per-arch constant.
+u64 vmemmap_addr = read_kallsyms_symbol("vmemmap_base");
+u32 zero = 0;
+int fd = bpf_map__fd(skel->maps.vmemmap_base_map);
+bpf_map_update_elem(fd, &zero, &vmemmap_addr, BPF_ANY);
+```
+
+Two caveats:
+
+- **`sizeof(struct page)` in BPF.** The verifier's BTF support lets you use `bpf_core_type_size(struct page)`, which gets resolved at load time from the kernel's BTF. Hardcoding 64 (the common size on 64-bit) is risky — the struct is occasionally 56 or 72 depending on config.
+- **KASLR.** If the kernel is built with KASLR, `vmemmap_base` shifts on each boot. Userspace must read the current value from kallsyms; compile-time constants will not work.
+
+The cleanest alternative, when your kernel supports it, is to use the `bpf_page_to_pfn` kfunc (added in newer kernels). A kfunc is a kernel function explicitly exported for BPF, with verifier type checking. If available, it is both safer and simpler:
+
+```c
+extern unsigned long bpf_page_to_pfn(struct page *page) __ksym;
+
+static __always_inline u64 folio_to_pfn_helper(struct folio *folio) {
+    return bpf_page_to_pfn(&folio->page);
 }
 ```
 
@@ -1594,12 +2411,15 @@ int on_dirty(struct pt_regs *ctx) {
 
 Every other handler follows the same pattern: get PFN from tracepoint/kprobe args → look up page_id → emit event. The pattern is always three lines of boilerplate plus the event-specific fields.
 
-### Bridging the block layer: sector → page_id
+### Tracing the I/O path: from page to sector and back
 
-The block I/O tracepoints (`block_rq_issue`, `block_rq_complete`) give you sector numbers, not PFNs. To connect an I/O event to a page_id, you need an additional lookup map that records which page_id is associated with which sector. This map gets populated when the filesystem builds the bio (the moment a page's disk sector is known) and consulted when the block tracepoints fire.
+The block I/O tracepoints (`block_rq_issue`, `block_rq_complete`) give you sector numbers, not PFNs. To connect an I/O event to a page_id, you need to record the `(dev, sector) → page_id` mapping *at bio construction time*, then look it up when the block tracepoints fire. Here is how to build this end-to-end.
+
+**Step 1: the sector map.**
 
 ```c
-// sector key: (device, sector) pair
+// sector_to_id: (device, sector) → page_id
+// Populated when bio is constructed; consulted when block layer tracepoints fire.
 struct sector_key {
     u64 dev;
     u64 sector;
@@ -1613,9 +2433,218 @@ struct {
 } sector_to_id SEC(".maps");
 ```
 
-You populate this by hooking `bio_add_folio` (or `bio_add_page`) with a kprobe. At that point, the bio has a sector number and the folio has a PFN (which gives you the page_id). You store `(dev, sector) → page_id`. Then when `block_rq_issue` fires, you look up the sector to find the page_id and emit EVT_IO_ISSUE. When `block_rq_complete` fires, you look up again for EVT_IO_COMPLETE and clean up the entry.
+**Step 2: populate the map when the filesystem builds the bio.**
 
-This sector map is the bridge between the mm world (where everything is PFNs and folios) and the block world (where everything is sectors and requests). Without it, your I/O events are disconnected from your page events.
+The point to hook is `bio_add_folio`, called by the filesystem (e.g., `mpage_readahead` or `mpage_writepages`) each time it adds a page to a bio. At that moment, we know both the folio (which gives us the PFN → page_id) and the bio's current sector:
+
+```c
+SEC("kprobe/bio_add_folio")
+int on_bio_add_folio(struct pt_regs *ctx) {
+    // bio_add_folio(bio, folio, len, off) — args in x0, x1, x2, x3 on ARM64
+    struct bio *bio = (struct bio *)PT_REGS_PARM1(ctx);
+    struct folio *folio = (struct folio *)PT_REGS_PARM2(ctx);
+
+    // Extract PFN from folio (same challenge as elsewhere — see Part 12
+    // notes on folio_to_pfn_helper)
+    unsigned long pfn = folio_to_pfn_helper(folio);
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+
+    // Read the bio's current sector and device
+    u64 sector = BPF_CORE_READ(bio, bi_iter.bi_sector);
+    struct block_device *bdev = BPF_CORE_READ(bio, bi_bdev);
+    dev_t dev = BPF_CORE_READ(bdev, bd_dev);
+    u32 opf = BPF_CORE_READ(bio, bi_opf);
+
+    // Record the sector → page_id mapping so on_rq_issue can find this page
+    struct sector_key key = { .dev = dev, .sector = sector };
+    bpf_map_update_elem(&sector_to_id, &key, &page_id, BPF_ANY);
+
+    // Also emit a "bio submit" event so userspace knows when the page
+    // was handed to the block layer (distinct from when I/O actually issues)
+    u32 evt_type = (opf & REQ_OP_MASK) == REQ_OP_WRITE ? EVT_WRITEBACK : EVT_READ;
+    struct page_event *e = emit(page_id, pfn, evt_type, 0);
+    if (!e) return 0;
+
+    e->io.sector = sector;
+    e->io.dev = dev;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+```
+
+**Step 3: catch request issue.**
+
+When the block layer actually dispatches a request to the driver, `block_rq_issue` fires. The tracepoint gives us `(dev, sector, nr_sectors)`. We look up page_ids for each 4KB sub-block in the request's sector range:
+
+```c
+SEC("tracepoint/block/block_rq_issue")
+int on_rq_issue(struct trace_event_raw_block_rq_issue *ctx) {
+    // One request can cover many pages. We emit an event for each page
+    // we are tracking in this sector range.
+    u64 dev = ctx->dev;
+    u64 sector = ctx->sector;
+    u32 nr_sectors = ctx->nr_sector;
+
+    // Each page is 8 sectors (4KB / 512). Walk the range.
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {   // verifier needs a bounded loop
+        if (i * 8 >= nr_sectors) break;
+
+        struct sector_key key = { .dev = dev, .sector = sector + i * 8 };
+        u64 *page_id_ptr = bpf_map_lookup_elem(&sector_to_id, &key);
+        if (!page_id_ptr) continue;
+
+        struct page_event *e = emit(*page_id_ptr, 0, EVT_IO_ISSUE, 0);
+        if (!e) continue;
+
+        e->io.sector = sector + i * 8;
+        e->io.dev = dev;
+        e->io.nr_sectors = 8;
+        bpf_ringbuf_submit(e, 0);
+    }
+    return 0;
+}
+```
+
+The `#pragma unroll` hint and bounded loop satisfy the verifier's termination requirement. Cap it at the largest request size you expect (64 pages = 256KB, which covers most UFS/NVMe workloads).
+
+**Step 4: catch request completion.**
+
+`block_rq_complete` fires when the hardware reports the I/O is done. Same lookup, plus cleanup:
+
+```c
+SEC("tracepoint/block/block_rq_complete")
+int on_rq_complete(struct trace_event_raw_block_rq_complete *ctx) {
+    u64 dev = ctx->dev;
+    u64 sector = ctx->sector;
+    u32 nr_sectors = ctx->nr_sector;
+    int error = ctx->error;
+
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        if (i * 8 >= nr_sectors) break;
+
+        struct sector_key key = { .dev = dev, .sector = sector + i * 8 };
+        u64 *page_id_ptr = bpf_map_lookup_elem(&sector_to_id, &key);
+        if (!page_id_ptr) continue;
+
+        struct page_event *e = emit(*page_id_ptr, 0, EVT_IO_COMPLETE, 0);
+        if (!e) {
+            bpf_map_delete_elem(&sector_to_id, &key);
+            continue;
+        }
+
+        e->io.sector = sector + i * 8;
+        e->io.dev = dev;
+        e->io.nr_sectors = 8;
+        bpf_ringbuf_submit(e, 0);
+
+        // Clean up — this sector is done, no more events expected for it
+        bpf_map_delete_elem(&sector_to_id, &key);
+    }
+    return 0;
+}
+```
+
+**Step 5: writeback completion.**
+
+For write I/O, the `EVT_IO_COMPLETE` event tells us the hardware finished writing. But we also want to know when `folio_end_writeback` runs — because only then is the folio marked clean and reclaimable. This is the *logical* end of writeback, distinct from the hardware completion:
+
+```c
+SEC("kprobe/folio_end_writeback")
+int on_wb_done(struct pt_regs *ctx) {
+    struct folio *folio = (struct folio *)PT_REGS_PARM1(ctx);
+    unsigned long pfn = folio_to_pfn_helper(folio);
+
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+
+    struct page_event *e = emit(page_id, pfn, EVT_WB_DONE, 0);
+    if (!e) return 0;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+```
+
+### Read I/O: catching cache-miss faults
+
+The read path is subtler. When userspace reads a file page that is already in the page cache, there is no I/O — just a memcpy. The events we want to capture are specifically the *cache miss* path, where readahead allocates new pages and submits a bio.
+
+The good news: the read path converges on the same functions we are already hooking:
+
+- `on_page_alloc` fires when readahead allocates a folio.
+- `on_cache_add` fires when `filemap_add_folio` inserts it.
+- `on_bio_add_folio` fires when `mpage_readahead` adds the folio to its bio.
+- `on_rq_issue` and `on_rq_complete` fire as the bio goes through the block layer.
+- When the read completes, `folio_end_read` (at `mm/filemap.c:1529`) is called. Hook it for an `EVT_READ_DONE` event.
+
+```c
+SEC("kprobe/folio_end_read")
+int on_read_done(struct pt_regs *ctx) {
+    struct folio *folio = (struct folio *)PT_REGS_PARM1(ctx);
+    bool success = PT_REGS_PARM2(ctx);
+    unsigned long pfn = folio_to_pfn_helper(folio);
+
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+
+    struct page_event *e = emit(page_id, pfn, EVT_READ_DONE, 0);
+    if (!e) return 0;
+
+    e->io.error = success ? 0 : 1;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+```
+
+With these handlers, the full read lifecycle shows up in the event stream:
+
+```
+[t=0]     EVT_ALLOC       page_id=42 pfn=0x1234 order=0 comm=app
+[t=2µs]   EVT_CACHE_INSERT page_id=42 ino=8517 index=20
+[t=5µs]   EVT_READ        page_id=42 dev=8:16 sector=1048
+[t=8µs]   EVT_IO_ISSUE    page_id=42 sector=1048 nr_sectors=8
+[t=412µs] EVT_IO_COMPLETE page_id=42 sector=1048
+[t=415µs] EVT_READ_DONE   page_id=42
+[t=418µs] EVT_FAULT       page_id=42 address=0x7f00... tgid=1234
+```
+
+The gaps tell the story: `ALLOC → CACHE_INSERT` is the page cache insertion (microseconds), `READ → IO_ISSUE` is block layer queuing, `IO_ISSUE → IO_COMPLETE` is the hardware latency, and `READ_DONE → FAULT` is the time to install the PTE after data arrived.
+
+### Write I/O: from dirty to durable
+
+For writes, the sequence is richer because writeback can happen long after the write, and pages can be re-dirtied during writeback:
+
+```
+[t=0]      EVT_FAULT       page_id=42 address=0x7f00... tgid=1234 is_write=1
+[t=100ns]  EVT_DIRTY       page_id=42
+   ...
+[t=5s]     EVT_WRITEBACK   page_id=42 dev=8:16 sector=1048
+[t=5s+1µs] EVT_IO_ISSUE    page_id=42 sector=1048 nr_sectors=8
+[t=5s+500µs] EVT_IO_COMPLETE page_id=42 sector=1048
+[t=5s+501µs] EVT_WB_DONE   page_id=42
+```
+
+Userspace can compute:
+- **Dirty queue time** = WRITEBACK.ts - DIRTY.ts (governed by `dirty_expire_centisecs`).
+- **Block queue time** = IO_ISSUE.ts - WRITEBACK.ts (how long the bio sat in the block layer).
+- **Hardware latency** = IO_COMPLETE.ts - IO_ISSUE.ts (pure device time).
+- **Writeback settle** = WB_DONE.ts - IO_COMPLETE.ts (time to clear PG_writeback and wake waiters).
+
+If the same page_id produces *another* DIRTY event between WB_DONE and the next allocation/free event, it means userspace re-dirtied a page that was already written back. This is a common pattern for SQLite: the same page (e.g., the rollback journal header) is written over and over, each cycle showing up as a separate DIRTY → WB_DONE pair in the stream.
+
+### Why we need the bio-add hook, not just the block tracepoints
+
+You might ask: why bother with the `bio_add_folio` kprobe at all? Why not just attach to `block_rq_issue` and look up the page from the sector?
+
+The problem is that `block_rq_issue` has the sector but has no connection back to the page. The mapping from sector to page_id *must* be recorded before the tracepoint fires, and the only point where both pieces are known together is at bio construction time (inside the filesystem's writepages/readahead callback). `bio_add_folio` is that point.
+
+An alternative worth mentioning: some kernels expose `trace_block_bio_queue` which fires when `submit_bio` is called. It carries the bio pointer, so a kprobe-like approach could walk the bio's `bi_io_vec` and record the sector for each page. The `bio_add_folio` kprobe is simpler because it handles one page at a time.
+
+### A note on plugging
+
+The block layer's plug mechanism means bios submitted within a `blk_start_plug`/`blk_finish_plug` section are deferred. Your `on_bio_add_folio` fires early; your `on_rq_issue` fires later when the plug is flushed. This is fine — the sector map keeps the mapping alive across the gap. But if you are computing "time from dirty to dispatch," the gap between `EVT_WRITEBACK` and `EVT_IO_ISSUE` includes this plug time, which can be several milliseconds on a busy system.
 
 ### The userspace reader
 
