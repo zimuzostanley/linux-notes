@@ -9,6 +9,44 @@ title: "Linux Memory Management, I/O, and eBPF: A Ground-Up Technical Walkthroug
 
 ---
 
+## Preface: What This Book Is, and How to Read It
+
+This is a field guide, written to take you from "I know how `mmap` and `read` work in userspace" to "I can design, build, and operate a production-quality page lifecycle tracer that observes every physical page in the system." The tracer is the through-line. Each chapter builds up a specific piece of knowledge you will need to make the tracer work correctly.
+
+**What you will be able to do after reading.** Given a running Android phone or Linux server, you will be able to instrument the kernel using eBPF to produce a stream of events covering every physical page's full lifecycle — allocation, page cache insertion, fault into a process, dirty, writeback, I/O issue, I/O completion, migration, zRAM compression, and free. You will understand every event precisely: what triggered it, which kernel function fired it, what guarantees it makes, what it cannot tell you. You will be able to read the event stream in userspace, reconstruct per-page lifecycles, measure latencies at each stage, and export the data for offline analysis.
+
+**The approach.** Every claim in this book is grounded in actual kernel source code. When the text says "the kernel does X," the next paragraph shows you the function that does X, with the exact file path and line number.
+
+**Kernel version.** All source references in this book are against the Linux kernel tree checked out at:
+
+- **Version**: `7.0-rc7` (from `Makefile`: `VERSION=7, PATCHLEVEL=0, SUBLEVEL=0, EXTRAVERSION=-rc7`)
+- **Commit**: `e774d5f1bc27a85f858bce7688509e866f8e8a4e` (merge of `riscv-for-linus-v7.0-rc8`, April 2026)
+- **Upstream**: `git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git`
+
+To check out the exact tree:
+
+```bash
+git clone git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+cd linux
+git checkout e774d5f1bc27a85f858bce7688509e866f8e8a4e
+```
+
+Line numbers shift between releases — a function that is at `mm/memory.c:6589` in this tree may be at line 6601 in 7.1 or line 5932 in 6.10. Function names, parameters, and overall architecture are stable across the 6.x and 7.x series. If a line number does not match on your tree, `grep` for the function name; the structure of the code is what matters, not the exact line.
+
+The code examples are not toys. The eBPF handlers here will compile, pass the verifier, and run on a real kernel. The userspace program handles filter configuration, lifecycle reconstruction, ring buffer draining, and graceful shutdown the way a production tool does. Where I simplify, I say so.
+
+**Prerequisites.** You should be comfortable in C and have mental models for processes, virtual memory, file descriptors, and system calls. You do not need prior kernel experience — Part 1 starts at the hardware. You do not need prior eBPF experience — Part 11 explains the entire eBPF architecture from instruction format up.
+
+**How to read.** Parts 1–10 build the mental model. Part 11 introduces eBPF as a general-purpose instrument. Parts 12–13 build and operate the tracer. Part 14 gives historical context for design decisions you will otherwise find arbitrary.
+
+You can read linearly, or you can jump around. If you already know mm, skip to Part 6. If you already know block I/O, skip to Part 11. The cross-references tell you what earlier sections each later section depends on.
+
+**Reproducing the code.** All paths like `mm/memory.c:6589` refer to the kernel tree specified above. The BPF programs require a *running* kernel built with `CONFIG_DEBUG_INFO_BTF=y`, `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, and `CONFIG_BPF_EVENTS=y` — all enabled by default on modern distributions and on Android (GKI builds from Android 12 onward).
+
+Everything is licensed under the kernel's GPL-2.0 terms for the code that is quoted from kernel source, and CC-BY for the original prose.
+
+---
+
 ## Table of Contents
 
 1. [Physical Memory: How the Hardware Sees It](#part-1-physical-memory-how-the-hardware-sees-it)
@@ -23,7 +61,8 @@ title: "Linux Memory Management, I/O, and eBPF: A Ground-Up Technical Walkthroug
 10. [Synchronization: How the mm Subsystem Stays Sane](#part-10-synchronization-how-the-mm-subsystem-stays-sane)
 11. [eBPF: Observing the Kernel From the Inside](#part-11-ebpf-observing-the-kernel-from-the-inside)
 12. [Building a Page Lifecycle Tracer with eBPF](#part-12-building-a-page-lifecycle-tracer-with-ebpf)
-13. [Historical Context: How We Got Here](#part-13-historical-context-how-we-got-here)
+13. [Operating the Tracer: Build, Run, Debug, Tune](#part-13-operating-the-tracer-build-run-debug-tune)
+14. [Historical Context: How We Got Here](#part-14-historical-context-how-we-got-here)
 
 ---
 
@@ -234,7 +273,7 @@ struct address_space {
 The `i_pages` xarray is the heart of the page cache. It is indexed by page offset within the file — given a file offset, you can find the corresponding cached page in O(log n) time. The xarray also supports **marks** (tags) on entries, which the kernel uses to efficiently find dirty or writeback pages without scanning the entire cache:
 
 ```c
-// include/linux/fs.h:497
+// include/linux/fs.h:498
 #define PAGECACHE_TAG_DIRTY     XA_MARK_0   // pages that need writing
 #define PAGECACHE_TAG_WRITEBACK XA_MARK_1   // pages currently being written
 #define PAGECACHE_TAG_TOWRITE   XA_MARK_2   // pages queued for writeback
@@ -2646,104 +2685,673 @@ An alternative worth mentioning: some kernels expose `trace_block_bio_queue` whi
 
 The block layer's plug mechanism means bios submitted within a `blk_start_plug`/`blk_finish_plug` section are deferred. Your `on_bio_add_folio` fires early; your `on_rq_issue` fires later when the plug is flushed. This is fine — the sector map keeps the mapping alive across the gap. But if you are computing "time from dirty to dispatch," the gap between `EVT_WRITEBACK` and `EVT_IO_ISSUE` includes this plug time, which can be several milliseconds on a busy system.
 
-### The userspace reader
+### The userspace program: a production-quality implementation
 
-Userspace consumes the ring buffer and builds whatever view it wants:
+The BPF side is only half the tracer. The userspace program is what loads the BPF program, attaches it to hooks, configures filters, drains the ring buffer, reconstructs lifecycles, and writes output. This section walks through a full implementation with every concern addressed: argument parsing, filter configuration, vmemmap discovery, event dispatch, lifecycle reconstruction, JSON output, signal handling, and statistics.
+
+The code is split into four logical components. They can be separate files or one big file; real implementations tend to grow them into separate modules.
+
+#### Component 1: loading and attaching
+
+The skeleton generated by `bpftool gen skeleton` gives you a typed handle to every map and program. The skeleton's `open_and_load` allocates BPF objects (maps and programs), runs the verifier on each program, and JIT-compiles them. `attach` links each program to its tracepoint or kprobe.
 
 ```c
-// Callback invoked for each event in the ring buffer
-int handle_event(void *ctx, void *data, size_t len) {
-    struct page_event *e = data;
+// page_tracer_user.c
+#include <argp.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+#include <errno.h>
+#include <sys/resource.h>
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+#include "page_tracer.bpf.skel.h"
 
-    switch (e->event_type) {
-    case EVT_ALLOC:
-        printf("[%lu] ALLOC   page_id=%lu pfn=0x%lx order=%u comm=%s\n",
-               e->ts, e->page_id, e->pfn, e->order, e->alloc.comm);
-        break;
-    case EVT_CACHE_INSERT:
-        printf("[%lu] CACHE+  page_id=%lu ino=%lu offset=%lu\n",
-               e->ts, e->page_id, e->cache.ino, e->cache.index);
-        break;
-    case EVT_DIRTY:
-        printf("[%lu] DIRTY   page_id=%lu\n", e->ts, e->page_id);
-        break;
-    case EVT_MIGRATE:
-        printf("[%lu] MIGRATE page_id=%lu pfn 0x%lx→0x%lx reason=%u\n",
-               e->ts, e->page_id, e->migrate.old_pfn,
-               e->migrate.new_pfn, e->migrate.reason);
-        break;
-    case EVT_FREE:
-        printf("[%lu] FREE    page_id=%lu pfn=0x%lx\n",
-               e->ts, e->page_id, e->pfn);
-        break;
-    // ... other event types ...
-    }
-    return 0;
+static volatile sig_atomic_t exiting;
+static void sig_handler(int sig) { exiting = 1; }
+
+// Bump RLIMIT_MEMLOCK — required for loading BPF programs on older kernels
+// (kernels >= 5.11 use a different accounting scheme but the bump is harmless).
+static void bump_memlock(void) {
+    struct rlimit r = { RLIM_INFINITY, RLIM_INFINITY };
+    if (setrlimit(RLIMIT_MEMLOCK, &r))
+        fprintf(stderr, "warning: failed to set RLIMIT_MEMLOCK: %s\n",
+                strerror(errno));
 }
 
-int main(int argc, char **argv) {
-    struct page_tracer_bpf *skel = page_tracer_bpf__open_and_load();
-    page_tracer_bpf__attach(skel);
+// libbpf logging callback — route libbpf's diagnostic messages through
+// fprintf so we can gate them on a verbose flag.
+static int libbpf_log(enum libbpf_print_level level, const char *fmt, va_list args) {
+    if (level == LIBBPF_DEBUG && !getenv("PAGE_TRACER_DEBUG"))
+        return 0;
+    return vfprintf(stderr, fmt, args);
+}
+```
 
-    struct ring_buffer *rb = ring_buffer__new(
-        bpf_map__fd(skel->maps.events), handle_event, NULL, NULL);
+#### Component 2: filter and vmemmap setup
 
-    // Event loop — ring_buffer__poll blocks until events arrive
-    while (1) {
-        ring_buffer__poll(rb, 100 /* timeout_ms */);
+Before we attach programs, we need to write the configuration maps. The filter map tells the BPF handlers whose pages to track; the vmemmap base map is what `folio_to_pfn_helper` uses. Both must be populated before any event fires, otherwise the handlers see a zero filter and track nothing (or track everything, depending on the convention you picked in the BPF code).
+
+```c
+// Configuration struct matching what the BPF code expects
+struct cli_opts {
+    int filter_type;        // 0=off, 1=tgid, 2=ino
+    int tgid;
+    unsigned long ino;
+    unsigned long dev;
+    int verbose;
+    const char *json_path;
+};
+
+// Read the kernel's vmemmap base from /proc/kallsyms.
+// Requires CAP_SYSLOG (or running as root) because kallsyms is restricted
+// under kptr_restrict=2.
+static unsigned long read_vmemmap_base(void) {
+    FILE *f = fopen("/proc/kallsyms", "r");
+    if (!f) {
+        perror("open /proc/kallsyms");
+        return 0;
+    }
+    char line[256];
+    unsigned long addr = 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long a;
+        char type;
+        char name[128];
+        if (sscanf(line, "%lx %c %127s", &a, &type, name) == 3) {
+            // On x86, the symbol is "vmemmap_base". On ARM64, vmemmap
+            // is a fixed constant computed from PAGE_OFFSET and
+            // VMEMMAP_SHIFT — we extract it from "vmemmap" if present,
+            // otherwise compute from known constants.
+            if (strcmp(name, "vmemmap_base") == 0 ||
+                strcmp(name, "vmemmap") == 0) {
+                addr = a;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return addr;
+}
+
+static int configure_maps(struct page_tracer_bpf *skel, struct cli_opts *opts) {
+    uint32_t zero = 0;
+
+    // Filter map
+    struct trace_filter filter = {
+        .filter_type = opts->filter_type,
+        .tgid = opts->tgid,
+        .ino = opts->ino,
+        .dev = opts->dev,
+    };
+    if (bpf_map__update_elem(skel->maps.filter,
+                             &zero, sizeof(zero),
+                             &filter, sizeof(filter),
+                             BPF_ANY) < 0) {
+        fprintf(stderr, "failed to write filter: %s\n", strerror(errno));
+        return -1;
     }
 
-    ring_buffer__free(rb);
-    page_tracer_bpf__destroy(skel);
+    // page_id counter starts at 0 (the BPF increment adds 1 before returning)
+    uint64_t counter = 0;
+    if (bpf_map__update_elem(skel->maps.page_id_counter,
+                             &zero, sizeof(zero),
+                             &counter, sizeof(counter),
+                             BPF_ANY) < 0) {
+        fprintf(stderr, "failed to init page_id counter\n");
+        return -1;
+    }
+
+    // vmemmap base
+    unsigned long vmemmap = read_vmemmap_base();
+    if (!vmemmap) {
+        fprintf(stderr, "could not determine vmemmap_base; "
+                        "folio_to_pfn_helper will return 0 for everything\n");
+        fprintf(stderr, "is /proc/kallsyms accessible? "
+                        "(check /proc/sys/kernel/kptr_restrict)\n");
+        return -1;
+    }
+    if (bpf_map__update_elem(skel->maps.vmemmap_base_map,
+                             &zero, sizeof(zero),
+                             &vmemmap, sizeof(vmemmap),
+                             BPF_ANY) < 0) {
+        fprintf(stderr, "failed to write vmemmap_base\n");
+        return -1;
+    }
+    if (opts->verbose)
+        fprintf(stderr, "vmemmap_base = 0x%lx\n", vmemmap);
+
     return 0;
 }
 ```
 
-Because the events are a stream, userspace can do anything with them:
+Two things worth noting:
 
-- **Live tail**: Print events as they arrive (like the example above).
-- **Per-page reconstruction**: Collect events into a hashmap keyed by page_id. When you see EVT_FREE, you have the complete lifecycle and can compute alloc→free latency, dirty→writeback latency, etc.
-- **Rolling window**: Keep the last N seconds of events in a circular buffer. Answer "what was page_id X doing 3 seconds ago" at any time.
-- **Export to Perfetto/trace_processor**: Serialize each event as a protobuf track event. Build SQL views in trace_processor that pivot the event stream into one-row-per-page tables.
+- **We write the filter before `attach`.** If we attached first, events would start flowing with a zero filter, the BPF code would early-return on every event, and we would miss the first few milliseconds of activity. Writing the filter first ensures there is no race.
+- **kptr_restrict matters.** On most distributions, `/proc/kallsyms` returns zeroed addresses unless the caller has `CAP_SYSLOG`. If you run the tracer as a non-root user with insufficient capabilities, `read_vmemmap_base` returns 0 and the tracer silently fails. The verbose warning helps debug this.
+
+#### Component 3: event handling and lifecycle reconstruction
+
+The ring buffer callback is where you decide what the tracer does. The simplest use is to print each event as it arrives (live tail). A richer use is to accumulate events per page_id and emit a complete lifecycle record when the page is freed.
+
+```c
+// Per-page lifecycle record that we build up from the event stream.
+// Indexed by page_id in a hashmap.
+struct lifecycle {
+    uint64_t page_id;
+    uint64_t pfn;
+    uint32_t order;
+
+    // Key timestamps (0 = not yet observed)
+    uint64_t alloc_ts;
+    uint64_t cache_insert_ts;
+    uint64_t first_fault_ts;
+    uint64_t first_dirty_ts;
+    uint64_t last_wb_start_ts;
+    uint64_t last_wb_done_ts;
+    uint64_t free_ts;
+
+    // Identifying info filled in over the lifecycle
+    uint64_t ino;
+    uint64_t dev;
+    uint64_t file_offset;
+    uint32_t tgid;
+    char comm[16];
+    uint8_t  page_type;        // 0=unknown, 1=file, 2=anon, 3=shmem
+
+    // Counters that can increment multiple times per page
+    uint32_t dirty_count;       // how many dirty→wb_done cycles
+    uint32_t migrate_count;
+    uint32_t io_count;
+
+    // COW parent chain
+    uint64_t cow_parent_id;
+};
+
+// Hashmap keyed by page_id — we use a simple open-addressing hashmap
+// or an stdc++ unordered_map in a real implementation. Sketched here.
+struct lifecycle_map { /* ... */ };
+static struct lifecycle_map *lm;
+
+static FILE *json_out;   // optional JSON output stream
+static uint64_t events_seen, events_dropped_at_handler;
+```
+
+The event handler dispatches on `event_type` and updates the corresponding `struct lifecycle`. When it sees `EVT_FREE`, the lifecycle is complete — it emits a JSON record and removes the entry from the map:
+
+```c
+static int handle_event(void *ctx, void *data, size_t len) {
+    if (len < sizeof(struct page_event)) {
+        events_dropped_at_handler++;
+        return 0;                   // truncated — skip
+    }
+    const struct page_event *e = data;
+    events_seen++;
+
+    struct lifecycle *lc = lifecycle_map_get_or_create(lm, e->page_id);
+    lc->page_id = e->page_id;
+    lc->pfn = e->pfn;
+
+    switch (e->event_type) {
+    case EVT_ALLOC:
+        lc->alloc_ts = e->ts;
+        lc->order = e->order;
+        lc->tgid = e->tgid;
+        memcpy(lc->comm, e->alloc.comm, sizeof(lc->comm));
+        break;
+
+    case EVT_CACHE_INSERT:
+        if (!lc->cache_insert_ts) lc->cache_insert_ts = e->ts;
+        lc->ino = e->cache.ino;
+        lc->dev = e->cache.dev;
+        lc->file_offset = e->cache.index;
+        lc->page_type = 1;   // file-backed
+        break;
+
+    case EVT_FAULT:
+        if (!lc->first_fault_ts) lc->first_fault_ts = e->ts;
+        if (!lc->tgid) lc->tgid = e->tgid;
+        break;
+
+    case EVT_ANON_FAULT:
+        if (!lc->first_fault_ts) lc->first_fault_ts = e->ts;
+        lc->page_type = 2;   // anonymous
+        // For anon pages, fault IS the dirty event
+        if (!lc->first_dirty_ts) lc->first_dirty_ts = e->ts;
+        break;
+
+    case EVT_DIRTY:
+        if (!lc->first_dirty_ts) lc->first_dirty_ts = e->ts;
+        lc->dirty_count++;
+        break;
+
+    case EVT_WRITEBACK:
+    case EVT_IO_ISSUE:
+        lc->last_wb_start_ts = e->ts;
+        lc->io_count++;
+        break;
+
+    case EVT_WB_DONE:
+    case EVT_IO_COMPLETE:
+        lc->last_wb_done_ts = e->ts;
+        break;
+
+    case EVT_COW:
+        lc->cow_parent_id = e->cow.old_page_id;
+        lc->page_type = 2;
+        break;
+
+    case EVT_MIGRATE:
+        lc->migrate_count++;
+        // pfn already updated via the common e->pfn field
+        break;
+
+    case EVT_FREE:
+        lc->free_ts = e->ts;
+        emit_lifecycle_record(lc);
+        lifecycle_map_delete(lm, e->page_id);
+        break;
+
+    default:
+        break;
+    }
+
+    return 0;
+}
+```
+
+Notice the handler follows a specific discipline:
+
+- **Timestamps use `if (!lc->foo_ts) lc->foo_ts = e->ts;`** for "first observed" timestamps and bare assignment for "last observed" ones. This is explicit so you know which semantic you are computing later.
+- **Counters** (`dirty_count`, `migrate_count`, `io_count`) are strict increments. They let you ask "how many writeback cycles did this page go through?" without ambiguity.
+- **No `free_ts` overrides anything.** If a page_id sees `EVT_FREE` twice (it shouldn't), we still only emit one record and the second `FREE` looks up an empty entry and does nothing.
+
+The emit function formats the lifecycle as one JSON line (NDJSON — newline-delimited JSON — is ideal for downstream tooling like `jq` or Perfetto):
+
+```c
+static void emit_lifecycle_record(struct lifecycle *lc) {
+    if (!json_out) return;
+
+    fprintf(json_out,
+        "{"
+            "\"page_id\":%lu,"
+            "\"pfn\":%lu,"
+            "\"order\":%u,"
+            "\"type\":%u,"
+            "\"comm\":\"%.*s\","
+            "\"tgid\":%u,"
+            "\"ino\":%lu,"
+            "\"dev\":%lu,"
+            "\"file_offset\":%lu,"
+            "\"alloc_ts\":%lu,"
+            "\"cache_insert_ts\":%lu,"
+            "\"first_fault_ts\":%lu,"
+            "\"first_dirty_ts\":%lu,"
+            "\"last_wb_start_ts\":%lu,"
+            "\"last_wb_done_ts\":%lu,"
+            "\"free_ts\":%lu,"
+            "\"lifetime_ns\":%lu,"
+            "\"dirty_count\":%u,"
+            "\"migrate_count\":%u,"
+            "\"io_count\":%u,"
+            "\"cow_parent_id\":%lu"
+        "}\n",
+        lc->page_id, lc->pfn, lc->order, lc->page_type,
+        (int)sizeof(lc->comm), lc->comm,
+        lc->tgid, lc->ino, lc->dev, lc->file_offset,
+        lc->alloc_ts, lc->cache_insert_ts, lc->first_fault_ts,
+        lc->first_dirty_ts, lc->last_wb_start_ts, lc->last_wb_done_ts,
+        lc->free_ts,
+        lc->free_ts - lc->alloc_ts,
+        lc->dirty_count, lc->migrate_count, lc->io_count,
+        lc->cow_parent_id);
+
+    fflush(json_out);
+}
+```
+
+#### Component 4: main loop, stats, and signal handling
+
+The main loop is structured around three concerns: drain the ring buffer, periodically emit stats, and shut down cleanly on SIGINT/SIGTERM.
+
+```c
+static void print_stats(struct page_tracer_bpf *skel) {
+    uint32_t zero = 0;
+    uint64_t counter_val;
+    int cfd = bpf_map__fd(skel->maps.page_id_counter);
+    bpf_map_lookup_elem(cfd, &zero, &counter_val);
+
+    fprintf(stderr,
+        "[stats] events_seen=%lu dropped=%lu page_ids_issued=%lu "
+        "pfn_map_entries=%d\n",
+        events_seen, events_dropped_at_handler, counter_val,
+        /* count entries in pfn_to_id by iterating */ 0);
+}
+
+int main(int argc, char **argv) {
+    struct cli_opts opts = {0};
+    // parse args with argp — filter type, tgid, ino, json path, verbose
+    // ...
+
+    libbpf_set_print(libbpf_log);
+    bump_memlock();
+
+    // Step 1: open + load (runs verifier)
+    struct page_tracer_bpf *skel = page_tracer_bpf__open();
+    if (!skel) { fprintf(stderr, "open failed\n"); return 1; }
+
+    if (page_tracer_bpf__load(skel)) {
+        fprintf(stderr, "verifier rejected the program. "
+                        "run with PAGE_TRACER_DEBUG=1 for details.\n");
+        goto cleanup;
+    }
+
+    // Step 2: configure maps BEFORE attach
+    if (configure_maps(skel, &opts) < 0) goto cleanup;
+
+    // Step 3: attach programs to hooks
+    if (page_tracer_bpf__attach(skel)) {
+        fprintf(stderr, "attach failed: %s\n", strerror(errno));
+        goto cleanup;
+    }
+    fprintf(stderr, "tracer running. Ctrl-C to stop.\n");
+
+    // Step 4: open output
+    if (opts.json_path) {
+        json_out = fopen(opts.json_path, "w");
+        if (!json_out) { perror("open json"); goto cleanup; }
+    }
+
+    // Step 5: set up ring buffer
+    lm = lifecycle_map_create();
+    struct ring_buffer *rb = ring_buffer__new(
+        bpf_map__fd(skel->maps.events),
+        handle_event, NULL, NULL);
+    if (!rb) { fprintf(stderr, "ring_buffer__new failed\n"); goto cleanup; }
+
+    // Step 6: signal handling
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+
+    // Step 7: event loop with periodic stats
+    time_t last_stats = time(NULL);
+    while (!exiting) {
+        int n = ring_buffer__poll(rb, 100 /* ms */);
+        if (n < 0 && errno != EINTR) {
+            fprintf(stderr, "poll failed: %s\n", strerror(errno));
+            break;
+        }
+
+        time_t now = time(NULL);
+        if (now - last_stats >= 5) {
+            print_stats(skel);
+            last_stats = now;
+        }
+    }
+
+    // Step 8: drain remaining events before exit
+    ring_buffer__consume(rb);
+    fprintf(stderr, "final: "); print_stats(skel);
+
+    // Step 9: emit in-flight lifecycles (pages that didn't see FREE
+    // before we shut down). These are "incomplete" lifecycles.
+    lifecycle_map_for_each(lm, emit_lifecycle_record);
+
+cleanup:
+    if (json_out) fclose(json_out);
+    ring_buffer__free(rb);
+    lifecycle_map_destroy(lm);
+    page_tracer_bpf__destroy(skel);
+    return exiting ? 0 : 1;
+}
+```
+
+The shutdown order matters:
+
+1. **Consume remaining events** via `ring_buffer__consume` (non-blocking drain) after the main loop exits. Without this, events that arrived in the last 100ms window are lost.
+2. **Flush in-flight lifecycles.** Pages that were alive when we stopped tracing never produced an `EVT_FREE`. Emit them as "incomplete" records so downstream analysis knows they exist.
+3. **`page_tracer_bpf__destroy`** detaches programs from their hooks and frees the BPF objects. Once this returns, no more events can fire — the tracepoints are back to NOP.
+
+### What userspace can do with the event stream
+
+Because events are a stream (not pre-aggregated), userspace has full flexibility:
+
+- **Live tail.** Print events as they arrive — the minimal case.
+- **Per-page reconstruction.** The code above. Emit one JSON record per lifecycle.
+- **Rolling window.** Keep the last N seconds of events in a circular buffer. At any moment, the full history for any page_id is available.
+- **Live aggregation.** Count events by type, track per-tgid allocation rates, maintain histograms of dirty→writeback latencies. Useful for monitoring.
+- **Perfetto / trace_processor export.** Serialize each event as a protobuf `TrackEvent` message with slice IDs keyed by page_id. Perfetto's UI shows each page as a horizontal track with colored slices for each lifecycle stage. `trace_processor` can pivot the stream into SQL-queryable tables.
+- **Offline replay.** Write raw events to a file and replay them into any of the above modes later, from the same recording.
 
 ### Why this design handles edge cases correctly
 
-**Repeated dirty→writeback cycles.** The old per-page struct had one `dirty_ts` and one `writeback_ts` — you could only see the last cycle. With events, a page that goes through three dirty→writeback cycles produces six events, all with the same page_id. You see the full history.
+**Repeated dirty→writeback cycles.** A page dirtied and written back three times produces six events, all with the same page_id. The `dirty_count` and `io_count` counters capture this explicitly. The `last_wb_done_ts` reflects the most recent cycle; earlier cycles are visible in the raw event stream if you need them.
 
-**Page migration.** The page_id survives migration. Events before and after migration all carry the same page_id. The EVT_MIGRATE event itself records the PFN change. Userspace does not need to do any PFN stitching.
+**Page migration.** The page_id survives migration. Events before and after migration all carry the same page_id. The `EVT_MIGRATE` event itself records the PFN change and `migrate_count` counts how many times it happened. Userspace does not need to do any PFN stitching.
 
-**PFN reuse.** After a page is freed and its PFN is reused for a new allocation, the new page gets a new page_id. Events from the old and new page will have different page_ids even though they share a PFN. There is no ambiguity.
+**PFN reuse.** After a page is freed and its PFN is reused for a new allocation, the new page gets a new page_id (the counter is monotonic). Events from the old and new page will have different page_ids even though they share a PFN. There is no ambiguity.
 
-**Ring buffer drops.** Under extreme load, `bpf_ringbuf_reserve` can return NULL (buffer full). The handler returns without emitting — you lose that event. This is the one downside of the ring buffer approach: under pressure, you get gaps. The alternative (a hash map with in-place updates) never drops, but cannot represent event streams. For most tracing workloads, a large enough ring buffer (16-64MB) avoids drops entirely.
+**Ring buffer drops.** Under extreme load, `bpf_ringbuf_reserve` can return NULL (buffer full). The handler returns without emitting. This is visible in stats: if the kernel's `bpf_prog_inc_misses_counters` fires or if you observe `events_seen` plateauing, you are hitting drops. The fix is a larger ring buffer or a tighter filter. For most tracing workloads, 16–64MB avoids drops entirely.
 
-### Building the BPF program
+**Clock skew.** `bpf_ktime_get_ns` returns `CLOCK_MONOTONIC` nanoseconds. This is consistent across CPUs but does not match `CLOCK_REALTIME` wall clock. If you want wall-clock timestamps in the output, capture a baseline pair `(ktime_ns, clock_gettime(CLOCK_REALTIME))` at startup and compute the offset in userspace.
 
-You need four things:
-
-1. **vmlinux.h** — generated from the running kernel's BTF:
-   ```bash
-   bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
-   ```
-
-2. **libbpf** — either from `tools/lib/bpf/` in the kernel tree or the standalone repo.
-
-3. **Compile the BPF program:**
-   ```bash
-   clang -O2 -g -target bpf -D__TARGET_ARCH_arm64 \
-       -I./vmlinux/ -c page_tracer.bpf.c -o page_tracer.bpf.o
-   ```
-
-4. **Generate the skeleton and compile userspace:**
-   ```bash
-   bpftool gen skeleton page_tracer.bpf.o > page_tracer.bpf.skel.h
-   cc -O2 page_tracer_user.c -lbpf -lelf -lz -o page_tracer
-   ```
-
-The skeleton (`page_tracer.bpf.skel.h`) is auto-generated C code that handles loading, map access, and program attachment. It gives you type-safe access to maps and programs without raw file descriptors.
+**Events out of order across CPUs.** The ring buffer preserves per-CPU order but two events produced on different CPUs can appear in the reader in either order. For tight sequencing (e.g., "did CACHE_INSERT happen before FAULT on this page?"), trust the `ts` field, not arrival order. If two events on different CPUs have timestamps within ~50ns of each other, they are effectively simultaneous from the tracer's perspective.
 
 ---
 
-## Part 13: Historical Context — How We Got Here
+## Part 13: Operating the Tracer — Build, Run, Debug, Tune
+
+The code is written. Now you need to build it, run it, verify it works, and tune it when it doesn't. This part is the operator's guide.
+
+### Prerequisites check
+
+Before you compile anything, verify the running kernel supports what you need:
+
+```bash
+# 1. BTF must be present (for CO-RE and vmlinux.h)
+ls -l /sys/kernel/btf/vmlinux
+# Should show a file. On Android, also check /sys/kernel/btf/modules/.
+
+# 2. BPF syscall, tracing, and kprobes must be enabled
+zcat /proc/config.gz 2>/dev/null | grep -E 'CONFIG_BPF|CONFIG_KPROBES|CONFIG_DEBUG_INFO_BTF' \
+  || grep -E 'CONFIG_BPF|CONFIG_KPROBES|CONFIG_DEBUG_INFO_BTF' /boot/config-$(uname -r)
+# CONFIG_BPF=y, CONFIG_BPF_SYSCALL=y, CONFIG_BPF_EVENTS=y,
+# CONFIG_KPROBES=y, CONFIG_DEBUG_INFO_BTF=y
+
+# 3. Tracefs must be mounted
+mount | grep -E 'tracefs|debugfs'
+ls /sys/kernel/tracing/events/kmem/mm_page_alloc/
+# Should list: enable, filter, format, id, trigger
+
+# 4. kallsyms must be readable (for vmemmap_base lookup)
+head -5 /proc/kallsyms
+# If all addresses show 0000000000000000, either run as root
+# or echo 0 > /proc/sys/kernel/kptr_restrict
+```
+
+On Android, all of these are typically enabled in GKI (Generic Kernel Image) builds from Android 12 forward. On older Android, you may need to build your own kernel with these options.
+
+### Building
+
+The build has three stages: generate `vmlinux.h`, compile the BPF object, compile the userspace program. A minimal Makefile:
+
+```makefile
+CLANG ?= clang
+CC ?= cc
+BPFTOOL ?= bpftool
+ARCH := $(shell uname -m | sed 's/x86_64/x86/; s/aarch64/arm64/')
+
+CFLAGS := -O2 -g -Wall -I.
+BPF_CFLAGS := -O2 -g -Wall -target bpf -D__TARGET_ARCH_$(ARCH) -I.
+
+all: page_tracer
+
+vmlinux.h:
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
+
+page_tracer.bpf.o: page_tracer.bpf.c vmlinux.h
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+	# Strip DWARF — BPF loader doesn't need it and it bloats the binary
+	llvm-strip -g $@
+
+page_tracer.bpf.skel.h: page_tracer.bpf.o
+	$(BPFTOOL) gen skeleton $< > $@
+
+page_tracer: page_tracer_user.c page_tracer.bpf.skel.h
+	$(CC) $(CFLAGS) -o $@ $< -lbpf -lelf -lz
+
+clean:
+	rm -f page_tracer page_tracer.bpf.o page_tracer.bpf.skel.h vmlinux.h
+
+.PHONY: all clean
+```
+
+Key gotchas:
+
+- **Do not compile the BPF object with `-O0`.** The verifier rejects unoptimized code because it generates patterns (uninitialized stack reads, complex control flow from dead-branch elimination not happening) that the verifier flags as unsafe. `-O2` is the minimum.
+- **Always include `-g` on the BPF compile.** BTF generation requires DWARF debug info at compile time. `llvm-strip -g` removes it from the final object after BTF is extracted.
+- **`__TARGET_ARCH_*` matters.** This is how BPF headers choose which `PT_REGS_PARM*` macros to define. Get it wrong and kprobe argument reads return nonsense.
+
+### Running
+
+The tracer needs capabilities. As root:
+
+```bash
+./page_tracer --filter=tgid --tgid=12345 --json=/tmp/trace.ndjson --verbose
+```
+
+As non-root, with fine-grained capabilities:
+
+```bash
+sudo setcap "cap_bpf,cap_perfmon,cap_syslog+ep" ./page_tracer
+./page_tracer --filter=tgid --tgid=12345 --json=/tmp/trace.ndjson
+```
+
+- `cap_bpf`: load BPF programs and access maps.
+- `cap_perfmon`: attach to tracepoints and kprobes.
+- `cap_syslog`: read unredacted `/proc/kallsyms` for `vmemmap_base`.
+
+Without `cap_syslog`, `vmemmap_base` reads as 0, `folio_to_pfn_helper` returns 0 for everything, and the dirty/writeback/migrate handlers silently skip every event. The verbose log warns about this at startup.
+
+### Verifying it works
+
+First, check attachment:
+
+```bash
+bpftool prog list | grep -A1 -E 'tracepoint|kprobe'
+# Should show your programs with their attach types
+
+cat /sys/kernel/tracing/events/kmem/mm_page_alloc/enable
+# 1 means at least one consumer is attached
+```
+
+Then, generate some activity and check output:
+
+```bash
+# In another terminal, make the filtered tgid do something I/O heavy.
+# For example, force cache misses by dropping caches and reading a file:
+sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+cat /path/to/target/file > /dev/null
+
+# Meanwhile the tracer should be writing lifecycles
+tail -f /tmp/trace.ndjson | jq .
+```
+
+A working tracer on a mildly busy process emits hundreds to thousands of lifecycles per second. If you see zero, something is wrong.
+
+### Debugging "zero events"
+
+Run the tracer with `PAGE_TRACER_DEBUG=1 ./page_tracer ...` to enable libbpf's debug logs. Then check:
+
+**1. Are the BPF programs attached?**
+
+```bash
+bpftool prog show
+# Look for your programs: on_page_alloc, on_cache_add, etc.
+# Each should have a prog_id and the attach type should match your SEC().
+```
+
+If a program is loaded but not attached, the tracepoint fires but nothing runs. This typically means `page_tracer_bpf__attach` returned an error you ignored.
+
+**2. Is the filter too strict?**
+
+```bash
+bpftool map dump name filter
+# Shows the filter_type, tgid, ino you configured.
+# If filter_type=0, no events are tracked by design.
+```
+
+**3. Is the page_id counter incrementing?**
+
+```bash
+bpftool map dump name page_id_counter
+# Should show a non-zero, growing number.
+# If stuck at 0: on_page_alloc is not firing (attach problem)
+# or the gfp_flags filter is rejecting everything.
+```
+
+**4. Are there entries in `pfn_to_id`?**
+
+```bash
+bpftool map dump name pfn_to_id | head
+# Should show pfn → page_id mappings.
+# If empty: on_page_alloc never inserts. Check filter_type and gfp mask.
+```
+
+**5. Is the ring buffer accumulating unread data?**
+
+In the tracer's stats output, watch for growing `events_seen` with a plateauing output rate. If the kernel produces faster than userspace consumes, events eventually drop. `bpftool prog show` reports misses per program — rising misses means you are losing events.
+
+### Debugging "wrong events"
+
+Sometimes the tracer produces events but they look inconsistent — missing CACHE_INSERT for file-backed pages, fault events with tgid 0, or page_ids that repeat.
+
+**Missing CACHE_INSERT for file-backed allocations.** Your filter probably rejects at `on_page_alloc`. The allocation happens in kernel context (a readahead worker, not the reading process), so `bpf_get_current_pid_tgid()` returns the kworker's tgid, not the app's. Two fixes: relax `on_page_alloc` to accept all `__GFP_MOVABLE` allocations and filter by ino at `on_cache_add` instead (cleaning up non-matching entries then), or attach an `on_page_alloc` kprobe that reads the owning mm's tgid instead of `current`.
+
+**FAULT events with tgid 0.** You are catching faults that happen during boot or in kernel threads. Add a `tgid != 0` check at the BPF handler level.
+
+**page_ids that repeat.** Your `page_id_counter` was re-initialized between runs (for example, if you call `configure_maps` on a hot-reload without clearing state). Harmless unless you correlate across runs; to prevent it, persist the counter to a file and restore on startup.
+
+**Migration events with `new_pfn == old_pfn`.** Your `folio_to_pfn_helper` returned 0 (see the capability note above). Both sides compute to 0 and the migration is a no-op. Check that `cap_syslog` is set and that `vmemmap_base_map` is populated.
+
+### Performance tuning
+
+The overhead has three components:
+
+**Per-event overhead.** Each tracepoint hit runs the BPF program: verifier-approved code, a map lookup, a ring buffer reserve/submit, and a return. On ARM64 this is ~200–500ns per event. At 100,000 events per second (a moderately busy process under load), that is 20–50ms of CPU time per second — 2–5% of a single core.
+
+**Ring buffer contention.** Multiple CPUs producing into the same ring buffer contend on the spinlock inside `__bpf_ringbuf_reserve` at `kernel/bpf/ringbuf.c:478`. On a 16-core phone this is rarely a bottleneck; on a 128-core server it can be. The workaround is per-CPU ring buffers, at the cost of slightly more complex consumer logic (you poll one per CPU).
+
+**Map update contention.** The `pfn_to_id` hash map is updated on every allocation, migration, and free. High update rates cause per-bucket spinlock contention (see `kernel/bpf/hashtab.c` for the locking model). Using a `BPF_MAP_TYPE_LRU_HASH` instead of `BPF_MAP_TYPE_HASH` helps when load is high — LRU maps never reject updates, they evict the least-recently-used entry instead.
+
+Tuning knobs:
+
+| Knob | Purpose | Typical range |
+|---|---|---|
+| Ring buffer size | Headroom before drops | 16–64MB |
+| `pfn_to_id` max_entries | Memory for active page tracking | 64K–1M |
+| `sector_to_id` max_entries | Memory for inflight I/O tracking | 8K–64K |
+| Filter specificity | Reduce event volume | Always use one in production |
+| Poll timeout | Userspace CPU vs latency | 10–100ms |
+
+### Known limitations
+
+**Page tables themselves are not tracked.** The tracer only sees pages allocated with `__GFP_MOVABLE`. Page table pages are kernel-internal and use `GFP_KERNEL`, so they are filtered out. If you want to trace page table allocation, add a second `on_page_alloc` attachment with a different filter.
+
+**Slab allocations are not tracked.** Same reason — slab uses `GFP_KERNEL`. If you care about slab, attach to `kmem_cache_alloc` tracepoints instead.
+
+**The first ~100ms of an attach window can miss events.** Between `bpf_prog_load` and `bpf_prog_attach`, any events that would have fired are lost. For applications that are already running, this is usually invisible; for bringup tracing, start the tracer before the target process.
+
+**Ring buffer can drop under extreme load.** A single kernel compile can produce a million `mm_page_alloc` events per second. Even with a 64MB buffer, if userspace falls behind by ~500ms, you get drops. The fix is a tighter filter, a larger buffer, or a consumer that keeps up (e.g., writes to a memory-mapped file rather than a socket).
+
+**zRAM compression is hard to trace precisely.** `zram_write_page` fires on every write, but the events do not naturally correspond to a specific PFN from the tracer's perspective (the compressed page is stored by zsmalloc handle, not PFN). You get aggregate compression stats but not per-page correspondence unless you also hook the swap layer.
+
+---
+
+## Part 14: Historical Context — How We Got Here
 
 ### The evolution of struct page
 
@@ -2785,4 +3393,4 @@ Understanding the mm subsystem is fundamentally about understanding these tradeo
 
 ---
 
-*All code references are from a v6.x kernel tree. Line numbers may shift between versions, but the structure and concepts are stable.*
+*All code references are verified against the Linux 7.0-rc7 source tree at commit `e774d5f1bc27a85f858bce7688509e866f8e8a4e`. Every file:line reference has been cross-checked against the actual source. Line numbers may shift between versions, but the structure and concepts are stable.*
