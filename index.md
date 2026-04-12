@@ -35,11 +35,11 @@ Line numbers shift between releases — a function that is at `mm/memory.c:6589`
 
 The code examples are not toys. The eBPF handlers here will compile, pass the verifier, and run on a real kernel. The userspace program handles filter configuration, lifecycle reconstruction, ring buffer draining, and graceful shutdown the way a production tool does. Where I simplify, I say so.
 
-**Prerequisites.** You should be comfortable in C and have mental models for processes, virtual memory, file descriptors, and system calls. You do not need prior kernel experience — Part 1 starts at the hardware. You do not need prior eBPF experience — Part 11 explains the entire eBPF architecture from instruction format up.
+**Prerequisites.** You should be comfortable in C and have mental models for processes, virtual memory, file descriptors, and system calls. You do not need prior kernel experience — Part 1 starts at the hardware (DRAM, caches, MMU). You do not need prior eBPF experience — Part 15 explains the entire eBPF architecture from instruction format up.
 
-**How to read.** Parts 1–10 build the mental model. Part 11 introduces eBPF as a general-purpose instrument. Parts 12–13 build and operate the tracer. Part 14 gives historical context for design decisions you will otherwise find arbitrary.
+**How to read.** Parts 1–3 cover the hardware: DRAM organization, the cache hierarchy, and page tables. Parts 4–6 cover the kernel data structures and tools. Parts 7–14 trace the mm subsystem in motion: faults, COW, writeback, block I/O, reclaim, zRAM, migration, synchronization. Part 15 introduces eBPF. Parts 16–17 build and operate the tracer. Part 18 gives historical context for design decisions you will otherwise find arbitrary.
 
-You can read linearly, or you can jump around. If you already know mm, skip to Part 6. If you already know block I/O, skip to Part 11. The cross-references tell you what earlier sections each later section depends on.
+You can read linearly, or you can jump around. If you already know hardware and mm, skip to Part 15. If you already know eBPF, skip to Part 16. The cross-references tell you what earlier sections each later section depends on.
 
 **Reproducing the code.** All paths like `mm/memory.c:6589` refer to the kernel tree specified above. The BPF programs require a *running* kernel built with `CONFIG_DEBUG_INFO_BTF=y`, `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, and `CONFIG_BPF_EVENTS=y` — all enabled by default on modern distributions and on Android (GKI builds from Android 12 onward).
 
@@ -49,42 +49,429 @@ Everything is licensed under the kernel's GPL-2.0 terms for the code that is quo
 
 ## Table of Contents
 
-1. [Physical Memory: How the Hardware Sees It](#part-1-physical-memory-how-the-hardware-sees-it)
-2. [The Data Structures That Describe Memory](#part-2-the-data-structures-that-describe-memory)
-3. [The Page Fault: Where Everything Starts](#part-3-the-page-fault-where-everything-starts)
-4. [Anonymous Memory and Copy-on-Write](#part-4-anonymous-memory-and-copy-on-write)
-5. [Dirty Pages and Writeback: Getting Data to Disk](#part-5-dirty-pages-and-writeback-getting-data-to-disk)
-6. [The Block I/O Layer: From Pages to Sectors](#part-6-the-block-io-layer-from-pages-to-sectors)
-7. [Reclaim: How the Kernel Takes Memory Back](#part-7-reclaim-how-the-kernel-takes-memory-back)
-8. [zRAM: Android's Swap Trick](#part-8-zram-androids-swap-trick)
-9. [Page Migration: Moving Pages Without Anyone Noticing](#part-9-page-migration-moving-pages-without-anyone-noticing)
-10. [Synchronization: How the mm Subsystem Stays Sane](#part-10-synchronization-how-the-mm-subsystem-stays-sane)
-11. [eBPF: Observing the Kernel From the Inside](#part-11-ebpf-observing-the-kernel-from-the-inside)
-12. [Building a Page Lifecycle Tracer with eBPF](#part-12-building-a-page-lifecycle-tracer-with-ebpf)
-13. [Operating the Tracer: Build, Run, Debug, Tune](#part-13-operating-the-tracer-build-run-debug-tune)
-14. [Historical Context: How We Got Here](#part-14-historical-context-how-we-got-here)
+1. [The Hardware Foundation: DRAM, Banks, Channels](#part-1-the-hardware-foundation-dram-banks-channels)
+2. [The Cache Hierarchy: How the CPU Hides Memory Latency](#part-2-the-cache-hierarchy-how-the-cpu-hides-memory-latency)
+3. [Virtual Memory and Page Tables: The Translation Machinery](#part-3-virtual-memory-and-page-tables-the-translation-machinery)
+4. [Kernel Data Structures: How Memory Is Described](#part-4-kernel-data-structures-how-memory-is-described)
+5. [Process Memory Lifecycle: fork, COW, and the Zero Page](#part-5-process-memory-lifecycle-fork-cow-and-the-zero-page)
+6. [Observing the Page Cache: Tools of the Trade](#part-6-observing-the-page-cache-tools-of-the-trade)
+7. [The Page Fault: Where Everything Starts](#part-7-the-page-fault-where-everything-starts)
+8. [Anonymous Memory and Copy-on-Write](#part-8-anonymous-memory-and-copy-on-write)
+9. [Dirty Pages and Writeback: Getting Data to Disk](#part-9-dirty-pages-and-writeback-getting-data-to-disk)
+10. [The Block I/O Layer: From Pages to Sectors](#part-10-the-block-io-layer-from-pages-to-sectors)
+11. [Reclaim: How the Kernel Takes Memory Back](#part-11-reclaim-how-the-kernel-takes-memory-back)
+12. [zRAM: Android's Swap Trick](#part-12-zram-androids-swap-trick)
+13. [Page Migration: Moving Pages Without Anyone Noticing](#part-13-page-migration-moving-pages-without-anyone-noticing)
+14. [Synchronization: How the mm Subsystem Stays Sane](#part-14-synchronization-how-the-mm-subsystem-stays-sane)
+15. [eBPF: Observing the Kernel From the Inside](#part-15-ebpf-observing-the-kernel-from-the-inside)
+16. [Building a Page Lifecycle Tracer with eBPF](#part-16-building-a-page-lifecycle-tracer-with-ebpf)
+17. [Operating the Tracer: Build, Run, Debug, Tune](#part-17-operating-the-tracer-build-run-debug-tune)
+18. [Historical Context: How We Got Here](#part-18-historical-context-how-we-got-here)
 
 ---
 
-## Part 1: Physical Memory — How the Hardware Sees It
+## Part 1: The Hardware Foundation — DRAM, Banks, Channels
 
-Before any software runs, your hardware has some number of DRAM chips soldered to a board. The memory controller presents these as a flat array of bytes, addressed from 0 to however much RAM you have. The kernel slices this into 4KB chunks called **page frames**. On a phone with 8GB of RAM, that is roughly 2 million page frames.
+Before any kernel code runs, you have silicon. Understanding what RAM actually *is* at the electrical level changes how you read the rest of this book. Every decision the kernel makes — how pages are sized, why NUMA matters, why DMA needs cache flushes, why rowhammer is a thing — comes from physical constraints of DRAM. Skip this part and later chapters read like arbitrary rules. Read it and they read like inevitable engineering.
 
-Each page frame gets an index number — its **PFN** (page frame number). PFN 0 is the first 4KB, PFN 1 is the next, and so on. The kernel maintains a giant array of small descriptor structures, one per page frame, so it can track what each page frame is being used for.
+### 1.1 DRAM: What Memory Actually Is
 
-The hardware also has an **MMU** (Memory Management Unit) that sits between the CPU and physical memory. When your program accesses address `0x7f000000`, the CPU does not send that address to the memory controller. Instead, the MMU translates it through a set of **page tables** — a tree structure stored in physical memory — to find the corresponding physical page frame. If no translation exists (the page table entry is empty), the MMU raises a **page fault exception** to the CPU, and the kernel's fault handler runs. This is the most important event in the mm subsystem.
+Every bit in your RAM is a tiny capacitor. Charged = 1, discharged = 0. These capacitors are organized into a grid of **rows** and **columns** inside each DRAM chip. The key physical facts:
 
-The page tables are a 4-level tree on both x86-64 and ARM64:
+**Reading is destructive.** When the memory controller activates a row, the charge flows out of every capacitor in that row into **sense amplifiers** (the "row buffer"). The sense amps detect 1 or 0, then write the charge back. This activate-sense-restore cycle is the fundamental operation of DRAM and takes ~30–50ns.
+
+**Capacitors leak.** Even without reading, charge drains away in about 64ms. The memory controller must periodically **refresh** every row — activate it and restore the charges — thousands of times per second. This steals ~5% of bandwidth. This is why it's called *Dynamic* RAM: the storage is inherently unstable.
+
+**SRAM (used in caches) is different.** Each bit uses a flip-flop circuit (6 transistors vs DRAM's 1 transistor + 1 capacitor). It holds state indefinitely while powered, reads non-destructively, and is much faster. But it costs ~6× the silicon area per bit, which is why caches are small (kilobytes to megabytes) and DRAM is large (gigabytes).
+
+### 1.2 DRAM Organization: Banks, Channels, Rows, Columns
+
+A single DRAM chip contains multiple **banks** (typically 16). Each bank is an independent array with its own row buffer:
 
 ```
-Virtual address (48 bits on ARM64):
-┌─────────┬─────────┬─────────┬─────────┬──────────────┐
-│ PGD idx │ PUD idx │ PMD idx │ PTE idx │ page offset  │
-│ 9 bits  │ 9 bits  │ 9 bits  │ 9 bits  │ 12 bits      │
-└─────────┴─────────┴─────────┴─────────┴──────────────┘
+One DRAM chip:
+┌─────────────────────────────────────┐
+│  Bank 0: [row buffer] [cell array]  │
+│  Bank 1: [row buffer] [cell array]  │
+│  ...                                │
+│  Bank 15:[row buffer] [cell array]  │
+│                                     │
+│  Shared: output pins to the bus     │
+└─────────────────────────────────────┘
 ```
 
-Each level is a page-sized array of 512 entries (9 bits = 512). The bottom level, the PTE (Page Table Entry), contains the physical PFN plus permission bits (readable, writable, executable, dirty, accessed). The kernel walks this tree like so:
+**Banks share the chip's output pins** — only one bank can send data on the bus at a time. But their internal work overlaps: while bank 0 sends data, bank 3 can be activating a row, and bank 7 can be restoring charges. The memory controller pipelines these operations to keep the bus busy.
+
+**Channels** are completely independent paths between the CPU's memory controller and separate sets of DRAM chips. Different wires, different chips, sharing nothing:
+
+```
+CPU
+ └── Memory Controller
+      ├── Channel 0 ── [bus] ── DRAM chips
+      ├── Channel 1 ── [bus] ── DRAM chips
+      └── Channel 2 ── [bus] ── DRAM chips
+```
+
+The parallelism stacks: channels are fully independent (different wires), banks overlap internal work (shared bus per channel). A system with 2 channels × 16 banks = 32 independent row buffers. This is the raw concurrency the kernel's page allocator and I/O scheduler try to exploit.
+
+### 1.3 Reading Data: The Burst
+
+When the memory controller needs data, it issues commands to the DRAM chip:
+
+**Row already open in the row buffer (row hit):**
+
+```
+Column command → burst → done
+~15ns
+```
+
+**Different row needed (row miss):**
+
+```
+Precharge old row  (~10ns)  — close current row
+Activate new row   (~30–50ns) — destructive read into sense amps
+Column command     (~15ns)  — select columns, start burst
+Total: ~55–75ns
+```
+
+The burst is a series of consecutive transfers. On DDR4 with a 64-bit (8-byte) bus and burst length 8:
+
+```
+8 bytes × 8 transfers = 64 bytes per burst
+```
+
+This 64-byte burst size is not a coincidence — **it matches the CPU cache line size**. One cache miss = one burst = one cache line fill. The entire hardware/software stack is designed around this alignment, and the kernel's `struct page` granularity (4KB = 64 lines × 64 bytes) is a direct consequence.
+
+Within a burst, the transfers are sequential (an auto-incrementing column counter inside the DRAM). Between separate column commands to the same open row, the row buffer is essentially random access — that is why sequential access within a 4KB page is so much faster than scattered access.
+
+### 1.4 DRAM Timing Parameters
+
+```
+tRP  (Row Precharge):        ~10ns    Close the currently open row
+tRCD (RAS to CAS Delay):     ~13ns    Activate a row, wait for sense amps
+tCAS (CAS Latency / CL):     ~13ns    Column command to data on bus
+tRAS (Row Active Time):      ~30ns    Minimum time row must stay open
+tRRD (Row to Row Delay):     ~5ns     Min gap between activations in different banks
+tFAW (Four Activate Window): ~25ns    No more than 4 activations in this window (power)
+tREFI (Refresh Interval):    ~7.8µs   How often each row must be refreshed
+```
+
+A row miss costs `tRP + tRCD + tCAS ≈ 36ns` minimum. A row hit costs just `tCAS ≈ 13ns`. This 3× difference is why the memory controller reorders requests to maximize row hits — a reorder that changes "row A, row B, row A, row B" into "row A, row A, row B, row B" saves tens of nanoseconds per access.
+
+Spec sheet notation: **DDR4-3200 CL16-18-18-36** means clock = 1600MHz (doubled to 3200 MT/s), tCAS=16 cycles, tRCD=18, tRP=18, tRAS=36. Multiply by the cycle time (0.625ns for DDR4-3200) to get nanoseconds.
+
+### 1.5 Channel Interleaving
+
+The mapping of physical addresses to channels is hardwired by the memory controller. Every address is permanently assigned to a channel based on its address bits:
+
+```
+With 2-channel interleaving on bit 5:
+
+Physical address 0x000 (bit 5=0) → Channel 0, Chip A
+Physical address 0x020 (bit 5=1) → Channel 1, Chip B
+Physical address 0x040 (bit 5=0) → Channel 0, Chip A
+```
+
+A 64-byte cache line can be split across two channels — each channel delivers 32 bytes simultaneously, filling the line in one burst period. The memory controller assembles the pieces. This is invisible to software but doubles effective bandwidth for cache line fills.
+
+Real controllers use **XOR hashing** rather than simple bit selection to distribute accesses evenly across channels regardless of stride pattern:
+
+```
+channel = bit6 XOR bit13 XOR bit20
+```
+
+This prevents pathological patterns where a common stride (e.g., 4KB page-aligned accesses) hits only one channel.
+
+The mapping applies to **everyone** — CPU cores, DMA controllers, GPUs all send physical addresses to the same memory controller with the same interleaving rules. A DMA transfer gets the same channel parallelism as CPU accesses. This matters for the tracer later: I/O throughput peaks when bios are large enough to span multiple channels.
+
+### 1.6 Rowhammer
+
+Rapidly activating a DRAM row (millions of times within a 64ms refresh interval) causes electrical disturbance that can flip bits in physically adjacent rows. This is a hardware physics problem, not a software bug — the capacitors in an adjacent row see induced currents from the neighbor's wordline toggling.
+
+Security implications: an attacker who knows the physical address layout can hammer rows adjacent to sensitive data (page table entries, credentials). A single bit flip in a PTE can change a permission bit from read-only to read-write, granting unauthorized access.
+
+Mitigations include **TRR (Target Row Refresh)** in DRAM hardware, hiding physical addresses from userspace (`/proc/pid/pagemap` requires `CAP_SYS_ADMIN` since kernel 4.0), ECC memory (detects and often corrects single-bit flips), and increased refresh rates in DDR5. The Linux kernel exposes pagemap data carefully precisely because knowing the PFN of a target page is the first step in exploiting rowhammer.
+
+### 1.7 From Hardware to the Kernel's View
+
+Now for the kernel's perspective. The memory controller presents all this machinery as a flat array of bytes, addressed from 0 to however much RAM you have. The kernel slices this into fixed 4KB chunks called **page frames**. On a phone with 8GB of RAM, that is roughly 2 million page frames.
+
+Each page frame gets an index number — its **PFN** (Page Frame Number). PFN 0 is the first 4KB, PFN 1 is the next, and so on. Conversion is pure bit shifting:
+
+```c
+pfn = physical_address >> 12;      // divide by 4096
+physical_address = pfn << 12;      // multiply by 4096
+```
+
+8GB of RAM = 2,097,152 page frames. The kernel maintains a giant array of small descriptor structures, one per page frame, so it can track what each page frame is being used for. On modern kernels this array is `struct page mem_map[]`, allocated at boot with one 64-byte entry per frame:
+
+```c
+struct page mem_map[2097152];  // ~2M entries for 8GB
+pfn_to_page(pfn) = &mem_map[pfn];  // just array indexing
+page_to_pfn(page) = page - mem_map;
+```
+
+Total cost: 2M × 64 bytes = 128MB (~1.6% of 8GB). Every byte added to `struct page` costs 2MB of RAM at boot. This is why `struct page` uses unions aggressively (Part 4) — byte efficiency translates directly into boot-time RAM overhead.
+
+The hardware also has an **MMU** (Memory Management Unit) that sits between the CPU and the memory controller. When your program accesses address `0x7f000000`, the CPU does not send that address to the memory controller. Instead, the MMU translates it through a set of **page tables** — a tree structure stored in physical memory — to find the corresponding physical page frame. If no translation exists (the page table entry is empty), the MMU raises a **page fault exception** to the CPU, and the kernel's fault handler runs. This is the most important event in the mm subsystem, and we return to it in Part 7.
+
+Next, we look at the cache hierarchy that sits between the CPU and DRAM, because everything the kernel does about memory performance (from `____cacheline_aligned` to DMA sync calls) is shaped by it.
+
+---
+
+## Part 2: The Cache Hierarchy — How the CPU Hides Memory Latency
+
+DRAM is slow. A CPU core running at 3 GHz completes a cycle in 0.33ns. A DRAM row miss costs ~55–75ns. If the CPU had to wait for every memory access, it would spend ~99% of its time stalled. Caches are how the hardware pretends memory is fast.
+
+Understanding the cache hierarchy is not optional for kernel work. Every kernel decision about memory layout (`____cacheline_aligned`, per-CPU data, struct field ordering), every DMA operation, every atomic primitive is shaped by it.
+
+### 2.1 Overview
+
+```
+Registers       ~1KB        ~0.3ns    same cycle
+TLB             ~64–1024    ~1ns      translation cache
+L1 cache        32–64KB     ~2ns      per-core, split I/D
+L2 cache        256KB–1MB   ~7ns      per-core
+L3 cache        4–32MB      ~20ns     shared across cores
+RAM             4–64GB      ~100ns    main memory
+SSD             128GB+      ~50µs     storage
+Disk            1TB+        ~5ms      storage
+```
+
+Each level is ~10–100× slower and ~10–100× larger than the one above. The design exploits **locality**: programs tend to reuse the same data (temporal locality) and access nearby data (spatial locality). Without locality, caches would not help and the whole pyramid would be pointless.
+
+### 2.2 Cache Line: The Unit of Transfer
+
+The cache never moves individual bytes. The unit of transfer at every level is the **cache line** — 64 bytes on all modern x86 and ARM64 CPUs.
+
+When you read 1 byte and it misses L1:
+
+```
+L1 asks L2 → L2 asks L3 → L3 asks DRAM
+DRAM delivers 64 bytes (one burst — see Part 1)
+Line installed in L3, L2, L1
+CPU gets its 1 byte
+The other 63 bytes are free cache hits if accessed soon
+```
+
+Why 64 bytes: smaller lines (16B) waste bandwidth on overhead and miss spatial locality. Larger lines (256B) fetch too much useless data and reduce total cache capacity (fewer lines fit). 64 bytes is the empirical sweet spot — one loop iteration over 4-byte ints gets 16 values per line.
+
+This size is baked into the kernel. You see it in macros like `L1_CACHE_BYTES` (defined per-arch, equal to 64 on all supported modern arches) and in attributes like `____cacheline_aligned` that force a struct member to start on a 64-byte boundary.
+
+### 2.3 Sets, Ways, and Tags
+
+Cache organization for a 32KB, 8-way set-associative L1 cache:
+
+```
+Total lines:  32768 / 64 = 512
+Sets:         512 / 8 = 64 sets
+```
+
+Think of it as a table with 64 rows (sets) and 8 columns (ways):
+
+```
+         Way 0    Way 1    Way 2   ...   Way 7
+Set  0  │ line   │ line   │ line   │   │ line   │
+Set  1  │ line   │ line   │ line   │   │ line   │
+...
+Set 63  │ line   │ line   │ line   │   │ line   │
+```
+
+A physical address is split into three fields:
+
+```
+ 47                    12  11       6  5       0
+┌────────────────────────┬──────────┬──────────┐
+│          TAG           │   SET    │  OFFSET  │
+│       (42 bits)        │ (6 bits) │ (6 bits) │
+└────────────────────────┴──────────┴──────────┘
+```
+
+**Offset (bits 5–0):** which byte within the 64-byte line.
+**Set index (bits 11–6):** which of the 64 sets — deterministic, not a choice.
+**Tag (bits 47–12):** stored alongside the data to identify which address is cached.
+
+On lookup: compute the set from the address, compare the tag against all 8 ways in parallel. If a tag matches and the valid bit is set, that's a hit. If no match, it's a miss.
+
+Each way stores: valid bit + tag + 64 bytes of data + dirty bit. The tag comparison uses dedicated parallel hardware comparators — all 8 ways checked simultaneously in ~1 cycle.
+
+The "32KB" is just the data. The actual silicon includes tag storage, valid/dirty bits, and LRU tracking — roughly 35–36KB total.
+
+### 2.4 VIPT: The Parallel Lookup Trick
+
+The cache set index (bits 11–6) falls entirely within the page offset (bits 11–0). Since the page offset is identical in virtual and physical addresses (the MMU doesn't translate it), the cache can start the set lookup using virtual address bits while the TLB simultaneously translates the upper bits.
+
+```
+CPU generates virtual address
+  ├── bits 11–0 → cache: compute set, read all 8 tags  (immediate)
+  └── upper bits → TLB: translate to physical PFN       (parallel)
+
+  TLB finishes → compare physical tag against loaded tags
+  Both done in ~same time → no added latency
+```
+
+This is **VIPT** — Virtually Indexed, Physically Tagged. It only works if the set index bits stay within the page offset. For 4KB pages (12-bit offset) with 64B lines: max set index is bits 11–6 = 6 bits = 64 sets. At 8-way, that's 64 × 8 × 64 = 32KB. This is why L1 caches are typically 32KB with 4KB pages.
+
+Doubling to 64KB would need 128 sets = 7-bit index using bits 12–6. Bit 12 is above the page offset and differs between virtual and physical — the parallelism breaks. Solutions: keep L1 small, use 16KB pages (Apple M-series, giving 14 bits of offset and room for 128KB L1), speculate on both possible sets, or page coloring.
+
+### 2.5 Page Coloring
+
+When the cache set index extends above the page offset, two virtual addresses mapping the same physical page can disagree on the extended bit(s), placing the same data in two different cache sets — **aliasing**. This causes coherency bugs: a write to one virtual alias is not visible through the other.
+
+Page coloring constrains the page allocator: a physical page's "color" (the problematic bit) must match the virtual address's color. This prevents aliasing but reduces allocator flexibility — you can only use pages of the right color, causing fragmentation. Linux on MIPS and some older ARM configurations implements page coloring; most modern designs avoid the problem by keeping L1 within the safe VIPT size.
+
+### 2.6 Write Behavior
+
+**Write-back (what all modern CPUs use):** writes go to L1 only. The line is marked dirty. L2, L3, and RAM have stale data — fine as long as L1 holds the line. Dirty data trickles down only on eviction.
+
+**Write-allocate:** on a write miss, fetch the full 64-byte line first, then modify. Necessary because you're writing maybe 4 bytes but the cache needs all 64 to be valid.
+
+```
+Before write:  L1="hello"  L2="hello"  RAM="hello"  (all agree)
+After write:   L1="world"  L2="hello"  RAM="hello"  (only L1 current)
+After evict:   L1=[gone]   L2="world"  RAM="hello"  (L2 updated)
+After L2 evict:             L2=[gone]  RAM="world"  (finally)
+```
+
+The dirty bit in each cache way tracks whether the line needs to be written back on eviction. An eviction of a clean line is free (just discard); an eviction of a dirty line costs a write back to the next level.
+
+### 2.7 Multi-Core Coherency: MESI
+
+Each core has its own L1/L2. Two cores can cache the same address. Writes by one core must be visible to the other. The hardware **MESI protocol** handles this automatically:
+
+```
+M (Modified):   only copy, it's been written, RAM is stale — we own it
+E (Exclusive):  only copy, matches RAM — can write without telling anyone
+S (Shared):     multiple copies exist, all match RAM — must notify before writing
+I (Invalid):    not usable — treat as absent
+```
+
+When Core 1 wants to write to a line Core 0 has in S state:
+
+1. Core 1 broadcasts "I want exclusive access" (Read-For-Ownership).
+2. Core 0 sees the broadcast, marks its copy Invalid.
+3. Core 1 transitions to Modified, does the write.
+
+This costs ~20–50ns for the cross-core communication — far more than a local L1 hit (~2ns). This is why contended atomic operations are slow: every atomic read-modify-write transfers a line from M or S → E → M with coherency traffic.
+
+### 2.8 False Sharing
+
+Two independent variables in the same 64-byte cache line cause cores to ping-pong the line between them:
+
+```c
+struct bad {
+    int core0_counter;  // offset 0, core 0 writes
+    int core1_counter;  // offset 4, core 1 writes
+};
+// Both in same cache line — every write invalidates the other core's copy
+```
+
+Fix: pad to separate cache lines:
+
+```c
+struct good {
+    int core0_counter;
+    char pad[60];
+    int core1_counter;  // now in a different cache line
+};
+```
+
+The kernel uses `____cacheline_aligned` annotations extensively on per-CPU data, spinlocks, and frequently accessed structures. In `struct mm_struct` at `include/linux/mm_types.h:1123`, for example, `mm_count` sits alone in its own cache line via `____cacheline_aligned_in_smp`:
+
+```c
+struct {
+    atomic_t mm_count;
+} ____cacheline_aligned_in_smp;
+```
+
+This is not cosmetic. `mm_count` is incremented and decremented by reference tracking across all CPUs; sharing its line with anything else would cause false sharing.
+
+### 2.9 DMA and Cache Coherency
+
+DMA-capable devices (NIC, disk controller, GPU) access RAM through the memory controller, **bypassing CPU caches**. This creates coherency problems:
+
+**CPU writes, device reads (e.g., sending a network packet):**
+
+```
+CPU writes data → sits in L1 cache, dirty
+Device DMA reads from RAM → gets stale data
+Result: corrupted packet
+```
+
+**Device writes, CPU reads (e.g., receiving a packet):**
+
+```
+Device DMA writes to RAM → new data in DRAM
+CPU reads → cache hit with old data
+Result: CPU processes garbage
+```
+
+The kernel must explicitly manage this with the DMA API:
+
+```c
+// Before device reads: flush dirty cache lines to RAM
+dma_sync_single_for_device(dev, addr, size, DMA_TO_DEVICE);
+
+// Before CPU reads DMA'd data: invalidate cache lines
+dma_sync_single_for_cpu(dev, addr, size, DMA_FROM_DEVICE);
+```
+
+**Cache operations:**
+
+- **Clean:** write dirty lines to RAM, keep in cache (cache and RAM agree).
+- **Invalidate:** mark lines Invalid, discard (next CPU access fetches from RAM).
+- **Flush:** clean + invalidate.
+
+**Critical constraint:** cache invalidation operates on whole 64-byte lines. DMA buffers must be cache-line aligned, or invalidation can discard adjacent kernel data. The DMA allocator (`dma_alloc_coherent`) enforces this by rounding sizes up and alignments to the cache line.
+
+**Coherent DMA:** for frequently shared memory (ring buffers between CPU and device), the kernel maps pages as **uncacheable** via PTE flags. Every access goes directly to RAM (~100ns vs ~2ns), but no sync calls are needed. This is the right tradeoff for small control regions; for bulk data (network packets, disk blocks), explicit sync on cacheable memory wins.
+
+Architectures differ significantly: x86 has cache-coherent DMA by default (the fabric snoops caches), so many `dma_sync_*` calls are no-ops. ARM64 and most embedded architectures are not coherent — the sync calls translate to real cache maintenance instructions. The kernel's DMA API hides this difference so drivers work identically on both.
+
+---
+
+## Part 3: Virtual Memory and Page Tables — The Translation Machinery
+
+We've seen the hardware. Now we look at how the kernel uses it to give each process the illusion of its own isolated, contiguous address space.
+
+### 3.1 Pages and Page Frames
+
+The kernel slices physical RAM into fixed 4KB chunks called **page frames**. Each gets a sequential index — its **PFN** (Page Frame Number):
+
+```
+PFN 0  →  physical bytes 0 to 4095
+PFN 1  →  physical bytes 4096 to 8191
+...
+```
+
+We met this in Part 1. 8GB of RAM = 2,097,152 page frames (~2 million). Conversion is pure bit shifting:
+
+```c
+pfn = physical_address >> 12;
+physical_address = pfn << 12;
+```
+
+### 3.2 Virtual Addresses and the MMU
+
+Programs use **virtual addresses**. The MMU (Memory Management Unit) hardware translates them to **physical addresses** on every memory access. This provides three benefits the kernel depends on:
+
+- **Isolation:** two processes using the same virtual address map to different physical pages.
+- **Contiguity illusion:** scattered physical pages appear contiguous to the process.
+- **Lazy allocation:** memory can be promised (`mmap` creates a VMA) without backing it with physical pages until first access. This is how a process can "allocate" 1GB in milliseconds — only the VMA structure is created; the pages are filled in lazily on fault.
+
+### 3.3 The 4-Level Page Table
+
+A virtual address (48 bits used on ARM64/x86-64) is split into five fields:
+
+```
+ 47        39 38        30 29        21 20        12 11          0
+┌──────────┬──────────┬──────────┬──────────┬──────────────────┐
+│  PGD idx │  PUD idx │  PMD idx │  PTE idx │   page offset    │
+│  9 bits  │  9 bits  │  9 bits  │  9 bits  │    12 bits       │
+└──────────┴──────────┴──────────┴──────────┴──────────────────┘
+```
+
+Each 9-bit index selects one of 512 entries in a table. Each table is one 4KB page (512 × 8 bytes). The 12-bit page offset is the same in virtual and physical addresses — it's not translated. The kernel walks this tree like so:
 
 ```c
 // This is the conceptual page table walk. The kernel does this in
@@ -98,15 +485,90 @@ pte = pte_offset_map(pmd, address);  // level 1 — the actual mapping
 
 If any level is missing, the kernel allocates a new page for it. This is demand-driven — page tables grow only as processes touch new memory regions. A process that maps 1TB of address space but only touches 4KB will have exactly the page table entries needed for that one page.
 
-**Why 4 levels?** Because 4 levels of 9-bit indices (4 * 9 = 36 bits) plus a 12-bit page offset gives 48 bits of virtual address space — 256TB. That is enough for now. Some newer CPUs support 5 levels for 57-bit addressing (128PB), but most ARM64 devices use 4.
+The 36 bits of page number (48 − 12) give 2^36 ≈ 68 billion possible virtual pages. A flat page table would need one 8-byte entry per possible page — 512GB per process. Impossible. The multi-level tree is sparse: if a process hasn't touched a region, the pointer at PGD or PUD level is NULL and the entire subtree below doesn't exist. One NULL at PGD eliminates 2^27 potential entries.
+
+Each level covers a different granularity:
+
+```
+PGD entry covers: 512GB
+PUD entry covers:   1GB
+PMD entry covers:   2MB
+PTE entry covers:   4KB
+```
+
+**Why 4 levels?** Because 4 levels of 9-bit indices (4 × 9 = 36 bits) plus a 12-bit page offset gives 48 bits of virtual address space — 256TB. That is enough for now. Some newer CPUs support 5 levels for 57-bit addressing (128PB), but most ARM64 devices use 4.
+
+### 3.4 What's in a PTE
+
+A PTE is 8 bytes (64 bits). On ARM64:
+
+```
+Bit 0:       Valid — is this entry present?
+Bits 47–12:  Physical PFN (36 bits → 256TB addressable)
+Bit 10:      Access Flag (AF) — hardware sets on any access
+Bits 8–7:    Access Permission (AP) — read/write, kernel/user
+Bit 54:      Execute Never (XN) — blocks code execution
+Bits 58–55:  Software bits — kernel's private flags, hardware ignores
+```
+
+**When bit 0 is 0 (invalid):** the MMU ignores the entry. The kernel repurposes the other 63 bits to encode swap locations, migration state, or NUMA hints. One set of bits serves completely different purposes depending on whether hardware or software is reading them. This bit-repurposing is how swap entries and migration entries fit in the same PTE slot — you saw a consequence of this in `handle_pte_fault` (Part 7 later): `if (!pte_present(vmf->orig_pte)) return do_swap_page(vmf);`. The PTE is "not present" but its bits encode where to find the page in swap.
+
+**Hardware modifications:** the MMU sets the Access Flag on any access and the Dirty bit on writes. These are reported *by the hardware* and *read by the kernel* — the kernel uses them to drive LRU decisions (hot pages stay, cold pages get reclaimed) and to know which pages need writeback.
+
+### 3.5 The TLB
+
+The TLB (Translation Lookaside Buffer) caches recent page table translations. TLB hit = ~1 cycle. TLB miss = full 4-level page table walk through RAM = 4 memory accesses = ~200 cycles.
+
+The TLB is small (typically 64–1024 entries) and highly associative. Modern CPUs have separate L1 instruction TLB, L1 data TLB, and a shared L2 TLB. Each entry maps a virtual page to a physical page plus permission bits — essentially a cached copy of a PTE.
+
+When the kernel changes a PTE (unmap, permission change, migration), the old translation may be cached in the TLB. The kernel must **flush** it. On multi-core systems, this requires TLB shootdown IPIs (inter-processor interrupts) to all cores that might have the stale entry — expensive (~microseconds per IPI, since each CPU has to stop what it's doing to service the IPI).
+
+The mm subsystem batches TLB flushes where possible. For example, during `try_to_unmap` (reclaim), the code sets `TTU_BATCH_FLUSH` to defer individual flushes and do one batch flush at the end. You'll see the performance consequences of TLB shootdowns in the COW path (Part 8), where `ptep_clear_flush` must happen before the new PTE is installed to prevent two CPUs from seeing different mappings.
+
+### 3.6 Who Does the Walk
+
+**Hardware (MMU):** on every memory access, billions of times per second. The process never knows. The MMU reads PTEs directly from the page table pages in physical memory, with the caveat that the tables must be laid out where the MMU expects them (pointed to by `CR3` on x86 or `TTBR0/TTBR1` on ARM64).
+
+**Kernel (software):** when modifying page tables — setting up mappings on fault, clearing them on munmap, changing permissions on mprotect. The kernel writes to the tables; the MMU reads them. The CPU has memory barriers and TLB flush instructions to coordinate the two (kernel write → TLB flush → MMU sees new mapping).
+
+### 3.7 ARM64 vs x86-64: Split Address Spaces
+
+**ARM64:** two page table base registers:
+
+```
+TTBR0_EL1: per-process userspace page table (changes on context switch)
+TTBR1_EL1: kernel page table (set once at boot, never changes, shared by all)
+```
+
+Addresses starting with `0x0000...` use TTBR0; addresses starting with `0xFFFF...` use TTBR1.
+
+**x86-64:** one register (CR3), so kernel and user share one tree. The upper PGD entries in every process point to the same shared kernel PUD pages. Kernel mapping changes at PMD/PTE level are automatically visible everywhere. PGD-level changes propagate lazily via vmalloc fault fixup.
+
+This is why interrupt handlers work without switching page tables — kernel addresses are mapped identically in every process's tree. When an interrupt fires, the CPU is already running some userspace process; its page table tree has the kernel mappings in the top half, so the interrupt handler can access kernel data, kernel code, and kernel stacks without changing any register.
+
+### 3.8 Page Table Size in Practice
+
+A typical process with 300 VMAs, 500MB virtual address space, 50,000 pages mapped:
+
+```
+PGD:       1 page        =    4KB
+PUD:       1–2 pages     =    8KB
+PMD:       1–4 pages     =   16KB
+PTE pages: ~100–150      = ~600KB  (dominates)
+Total: roughly 600–700KB
+```
+
+The bottom level (PTE pages) dominates because it's where actual mappings live. Each PTE page maps 2MB of virtual address space (512 × 4KB), so 500MB of mapped memory needs 250 PTE pages minimum, clustered by virtual address locality.
+
+On Android, where a process has many shared libraries and mmap'd files scattered across the address space, page table memory can reach several megabytes. This is part of why `posix_spawn` (Part 5) is valuable — it avoids copying all this page table state.
 
 ---
 
-## Part 2: The Data Structures That Describe Memory
+## Part 4: Kernel Data Structures — How Memory Is Described
 
-Five data structures form the backbone of the mm subsystem. Everything else builds on these, so it is worth spending time here.
+Five data structures form the backbone of the mm subsystem. Everything else builds on these, so it is worth spending time here. Read this section slowly. The tracer we build in Part 16 reaches into almost every one of these structures, and any hand-wave here becomes a bug there.
 
-### task_struct → mm_struct
+### 4.1 task_struct → mm_struct
 
 Every thread in the kernel is represented by a `task_struct`. Every process (which may have many threads) has exactly one `mm_struct` that describes its entire virtual address space. All threads in a process share the same `mm_struct`.
 
@@ -145,9 +607,9 @@ struct mm_struct {
 
 The `mm_mt` field is a **maple tree** — a B-tree variant optimized for ranges. It replaced the old red-black tree (`mm_rb`) and linked list (`mmap`) in v6.1. The maple tree is more cache-friendly because it packs multiple entries into each node, reducing the number of pointer chases during VMA lookup. On a process with hundreds of VMAs (common on Android — shared libraries, mmap'd files, anonymous regions), this matters.
 
-### vm_area_struct (VMA)
+### 4.2 vm_area_struct (VMA)
 
-A VMA describes one contiguous region of virtual address space with uniform properties — same permissions, same backing. When you call `mmap()`, the kernel creates a VMA. When you call `munmap()`, it removes one (or splits one).
+A VMA describes one contiguous region of virtual address space with uniform properties — same permissions, same backing. When you call `mmap()`, the kernel creates a VMA. When you call `munmap()`, it removes one (or splits one). When you call `mprotect()` to change permissions on part of a mapping, the kernel splits a VMA into pieces.
 
 ```c
 // include/linux/mm_types.h:913
@@ -164,93 +626,265 @@ struct vm_area_struct {
 };
 ```
 
-The `vm_file` field is the key distinguisher:
-- **Non-NULL**: This is a file-backed mapping. `vm_file` points to the open file, and `vm_pgoff` says where in the file this region starts.
-- **NULL**: This is anonymous memory — heap, stack, or `mmap(MAP_ANONYMOUS)`. There is no file on disk; the data exists only in RAM (or in swap/zram if evicted).
+**The vm_file discriminator:**
 
-The `vm_ops` field points to a table of function pointers. The most important one is `fault`, which the kernel calls when a page fault happens in this VMA. For file-backed mappings, this is typically `filemap_fault`. For anonymous mappings, the kernel takes a different code path entirely (it does not go through `vm_ops->fault`).
+- `vm_file != NULL` → file-backed mapping (code, shared libraries, mmap'd files, tmpfs).
+- `vm_file == NULL` → anonymous memory (heap, stack, `MAP_ANONYMOUS`).
 
-To find the VMA for a given virtual address, the kernel searches the maple tree:
+This one field tells the entire fault path which way to go.
 
-```c
-struct vm_area_struct *vma = find_vma(mm, address);
+**vm_flags carry both current and possible permissions:**
+
+```
+VM_READ, VM_WRITE, VM_EXEC           — current permissions
+VM_MAYREAD, VM_MAYWRITE, VM_MAYEXEC  — mprotect() can enable these
+VM_SHARED                             — writes go back to file (MAP_SHARED)
+VM_GROWSDOWN                          — stack, grows downward on fault below vm_start
+VM_LOCKED                             — mlocked, cannot be swapped
+VM_HUGETLB                            — backed by huge pages
+VM_DONTCOPY                           — not duplicated on fork()
 ```
 
-This is O(log n) in the number of VMAs. A typical Android app has 200-500 VMAs.
+The distinction between VM_WRITE and VM_MAYWRITE is subtle and important. A private file mapping opened read-only starts with `VM_READ | VM_MAYWRITE` — writable by mprotect but not right now. `mprotect()` checks VM_MAYWRITE before allowing PROT_WRITE. A shared mapping of a read-only file has VM_MAYWRITE unset — mprotect to writable is denied because the write would need to go back to a file the process can't write.
 
-### struct page and struct folio
+VMAs are stored in a **maple tree** (B-tree variant) for O(log n) lookup by address. `find_vma(mm, address)` searches this tree — called on every page fault. A typical Android app has 200–500 VMAs. The maple tree replaced the older red-black tree plus linked list (`mm_rb` + `mmap`) in kernel v6.1 because the old linked list had O(n) iteration and poor cache behavior.
 
-Every physical page frame has a `struct page` descriptor. These are allocated at boot time in a giant array (the **mem_map** array, or on NUMA systems, per-node arrays). Given a PFN, you can get the `struct page` instantly: `pfn_to_page(pfn)` is just array indexing.
+**mmap_lock discipline:**
+
+- Page faults take `mmap_lock` for read (shared — concurrent faults on different VMAs proceed in parallel).
+- `mmap`/`munmap`/`mprotect` take it for write (exclusive — blocks all faults during the modification).
+
+Newer kernels add **per-VMA locks** for better scalability: a fault only needs to lock the specific VMA it's touching, so faults on different VMAs never serialize. We come back to this in Part 14.
+
+**VMA manipulation primitives:**
+
+- `mmap()` → creates a VMA.
+- `munmap()` → removes a VMA (or the piece of one that's being unmapped), and clears the PTEs in that range.
+- `mprotect()` → may split a VMA into pieces with different permissions. Adjacent VMAs with identical properties after the operation may be merged.
+- `mremap()` → moves a VMA to a different virtual address range.
+
+### 4.3 vm_operations_struct
+
+Every file-backed VMA has a `vm_ops` pointer to a table of function callbacks. The filesystem provides these; mm code calls into them via the pointer:
+
+```c
+struct vm_operations_struct {
+    void (*open)(struct vm_area_struct *);         // VMA duplicated (fork) or split
+    void (*close)(struct vm_area_struct *);        // VMA removed
+    vm_fault_t (*fault)(struct vm_fault *);        // page fault in this VMA
+    vm_fault_t (*page_mkwrite)(struct vm_fault *); // shared page becoming writable
+    vm_fault_t (*huge_fault)(struct vm_fault *, unsigned int order);
+};
+```
+
+**`fault`**: called when the PTE is missing. For file-backed VMAs, this is typically `filemap_fault` (checks page cache, reads from disk on miss). For anonymous VMAs, `vm_ops` is `NULL` — the kernel uses a hardcoded path (`do_anonymous_page`). We trace both in Part 7.
+
+**`page_mkwrite`**: called when a `MAP_SHARED` page transitions from read-only to writable. This is the filesystem's chance to reserve disk space, set up journaling, take internal locks — *before* the process can dirty the page freely. Without this, a process could fill up an ext4 filesystem simply by dirtying already-allocated pages, with no opportunity for the FS to signal ENOSPC.
+
+**`open`/`close`**: called when VMAs are duplicated (fork), split (mprotect), or destroyed (munmap/exit). Used for reference counting on the backing object. A file-backed VMA's `open` increments the file's reference count; `close` decrements it.
+
+### 4.4 struct page
+
+One per physical page frame. Allocated at boot in a flat array. 64 bytes each (one cache line — not an accident; see Part 2). Never allocated or freed by mm code — repurposed as page frames change use.
+
+```c
+struct page mem_map[2097152];  // ~2M entries for 8GB of RAM
+pfn_to_page(pfn) = &mem_map[pfn];   // just array indexing
+page_to_pfn(page) = page - mem_map;
+```
+
+Total cost at boot: 2M × 64 bytes = 128MB (~1.6% of 8GB). Every byte added to `struct page` costs 2MB of RAM system-wide. This is why the union trick below matters so much.
+
+**The union trick.** A page frame can be page cache, anonymous memory, slab cache, network buffer, ZONE_DEVICE, etc. Different uses need different metadata. A C union stores different interpretations in the same bytes:
 
 ```c
 // include/linux/mm_types.h:79
 struct page {
-    memdesc_flags_t flags;                // PG_locked, PG_dirty, PG_writeback, etc.
+    memdesc_flags_t flags;                 // always present — tells you which union
     union {
-        struct {                          // when used for page cache or anon memory
-            struct list_head lru;         // position on LRU list (for reclaim)
+        struct {                           // page cache or anonymous memory
+            struct list_head lru;          // position on LRU list (for reclaim)
             struct address_space *mapping; // who owns this page
-            pgoff_t __folio_index;        // offset within that owner
-            unsigned long private;        // filesystem-specific data
+            pgoff_t __folio_index;         // offset within that owner
+            unsigned long private;         // filesystem-specific data or swap entry
         };
-        struct {                          // when used by the network stack
+        struct {                           // network stack page_pool
             unsigned long pp_magic;
             struct page_pool *pp;
-            // ...
+            unsigned long _pp_mapping_pad;
+            unsigned long dma_addr;
+            atomic_long_t pp_ref_count;
         };
-        struct {                          // when a tail page of a compound page
-            unsigned long compound_head;
+        struct {                           // tail page of a compound page
+            unsigned long compound_head;   // bit 0 set; points to head page
         };
+        struct {                           // ZONE_DEVICE pages (persistent memory)
+            void *_unused_pgmap_compound_head;
+            void *zone_device_data;
+        };
+        struct rcu_head rcu_head;          // for freeing via RCU
     };
-    atomic_t _mapcount;                   // how many PTEs point to this page
-    atomic_t _refcount;                   // reference count
+    union {
+        unsigned int page_type;            // for "typed" folios (slab, buddy, etc.)
+        atomic_t _mapcount;                // how many PTEs point to this page
+    };
+    atomic_t _refcount;                    // total references from all sources
+#ifdef CONFIG_MEMCG
+    unsigned long memcg_data;              // memory cgroup accounting
+#endif
 };
 ```
 
-Notice the `union`. The same 64-byte `struct page` is reused for completely different purposes depending on what the page frame is being used for. The `flags` field tells you which union member is active. This density is deliberate — with 2 million pages, every byte in this struct costs 2MB of RAM at boot.
+The `flags` field tells you which union member is valid. Helper macros like `PageSlab(page)`, `PageBuddy(page)`, `PageLRU(page)` test specific flag bits to confirm which interpretation is safe. This density is deliberate — with 2 million pages, every byte costs 2MB of RAM. A 72-byte struct would cost 144MB instead of 128MB, non-trivial on a 4GB phone.
 
-The **mapping** field is particularly clever:
+### 4.5 The mapping Field: Pointer Bit Stealing
 
-- For file-backed pages: `mapping` points to the file's `address_space` struct. You follow `mapping->host` to get the inode, which gives you the filename.
-- For anonymous pages: `mapping` has its lowest bit set to 1. The rest of the pointer (with bit 0 masked off) points to an `anon_vma` struct, which is used for reverse mapping.
-- For free pages: `mapping` is meaningless; the page is on a buddy freelist.
+`struct address_space` is always aligned to at least 8 bytes (usually more), so legitimate pointers always have bits 0–2 as zero. The kernel steals bit 0:
+
+```
+Bit 0 = 0: file-backed page
+  mapping is a real address_space pointer. Dereference directly.
+  folio->mapping→host gives the inode (file).
+
+Bit 0 = 1: anonymous page
+  Mask off bit 0 to get an anon_vma pointer.
+  anon_vma is the reverse mapping structure for this page.
+
+NULL: free page or special use.
+```
 
 You can test which case applies:
 
 ```c
-// include/linux/page-flags.h
+// include/linux/page-flags.h and mm/rmap.c use these checks
 if (folio->mapping && !((unsigned long)folio->mapping & 1))
     // file-backed
 else if (folio->mapping && ((unsigned long)folio->mapping & 1))
     // anonymous
 ```
 
-A **folio** is a newer abstraction (introduced around v5.16-v5.18) that wraps one or more contiguous `struct page` objects as a single unit. A folio of order 0 is a single 4KB page. A folio of order 4 is 16 contiguous pages (64KB). Large folios reduce overhead — instead of managing 16 separate pages, the kernel manages one folio. The transition from page to folio is still ongoing; much of the mm code now takes `struct folio *` parameters instead of `struct page *`.
+**Why this optimization matters.** File-backed is the common fast path — every page cache lookup, every writeback, every mmap fault checks `mapping`. Requiring a mask operation in the fast path would cost a cycle. Anonymous is the rare path (reclaim, migration), and the mask cost is acceptable there.
 
-In memory, a folio IS a page — they occupy the same bytes:
+The scheme also lets the *same pointer field* serve two roles without adding a separate type tag — saving bytes in `struct page` at the cost of a tiny bit of complexity in the handful of places that care.
+
+### 4.6 The index Field
+
+`folio->index` (aliased as `page->__folio_index` in `struct page`) means different things for different page types:
+
+```
+File page:  page offset within the file (page 0, 1, 2, ...)
+            Combined with mapping, uniquely identifies this page.
+
+Anon page:  virtual page number where this page was first created
+            (the address >> 12 from the fault that allocated it)
+            Used during reverse mapping to compute virtual addresses.
+
+Shmem:      page offset within the shmem inode (like file).
+```
+
+For file pages, `(mapping, index)` is the primary key in the page cache. `filemap_get_folio(mapping, index)` is an O(log n) xarray lookup.
+
+### 4.7 _mapcount and _refcount
+
+Two reference counters that mean very different things:
+
+```
+_mapcount: how many PTEs point to this page
+  Value -1 = unmapped (zero PTEs)
+  Value  0 = one PTE
+  Value  N = N+1 PTEs
+  Used by: COW (reuse page if mapcount is 1?), reclaim (need try_to_unmap?)
+
+_refcount: total references from all sources
+  Each PTE: +1
+  Page cache xarray: +1
+  Kernel code holding folio_get(): +1
+  DMA pin: +1
+  Active bio: +1
+  When this hits 0: page is freed to the buddy allocator
+```
+
+They answer different questions. A page in the page cache but not mapped by any process has `_mapcount = -1, _refcount = 1` — reclaim can free it without calling `try_to_unmap`, but must first remove it from the xarray (which drops the refcount to 0, triggering the free).
+
+The offset encoding of `_mapcount` (−1 for zero PTEs) is a trick so that `atomic_add_negative(-1, &page->_mapcount)` returns true exactly when the page becomes unmapped. This lets `folio_remove_rmap_pte` atomically decrement and check "was this the last PTE?" in one instruction.
+
+### 4.8 Page Flags
+
+```
+PG_locked       page is locked for I/O (others sleep waiting on folio_wait_locked)
+PG_uptodate     page contents are valid (set after successful read from disk)
+PG_dirty        page modified, needs writeback to disk
+PG_writeback    bio in flight writing this page to disk
+PG_lru          page is on an LRU list (reclaim can find it)
+PG_active       page is on the active LRU (hot, keep it)
+PG_swapbacked   page goes to swap on reclaim (anon or tmpfs)
+PG_referenced   page was recently accessed
+PG_waiters      someone is sleeping on this folio — wake them on unlock
+PG_reclaim      page is queued for reclaim
+```
+
+From `include/linux/page-flags.h` (see lines 94–111 for the enum):
+
+```c
+enum pageflags {
+    PG_locked,         /* Page is locked. Don't touch. */
+    PG_writeback,      /* Page is under writeback */
+    PG_referenced,
+    PG_uptodate,
+    PG_dirty,
+    PG_lru,
+    PG_active,
+    // ...
+    PG_swapbacked,     /* Page is backed by RAM/swap */
+    // ...
+};
+```
+
+Flags are tested, set, and cleared via atomic helpers: `PageDirty(page)`, `SetPageDirty(page)`, `ClearPageDirty(page)`, `TestSetPageLocked(page)`. The atomic test-and-set variants are critical — many flag transitions happen under concurrent access and the atomic ops prevent lost updates.
+
+The upper bits of `flags` encode the NUMA node and zone ID, so the kernel can determine a page's node/zone from flags alone without extra lookups. This is the "FIELDS" area at the high end of the flags word mentioned in the `page-flags.h` comment.
+
+### 4.9 struct folio
+
+A folio is a type-level guarantee that you have the head page of a (possibly compound) page. In memory, a folio IS a page — `page_folio(page)` is just a cast.
 
 ```c
 // include/linux/mm_types.h:401
 struct folio {
     union {
         struct {
-            memdesc_flags_t flags;             // line 406
-            struct address_space *mapping;      // line 421
-            pgoff_t index;                      // line 423 — offset in file (in pages)
-            atomic_t _mapcount;                 // line 430
-            atomic_t _refcount;                 // line 431
+            memdesc_flags_t flags;              // line 406
+            struct address_space *mapping;       // line 421
+            pgoff_t index;                       // line 423 — file offset in pages
+            atomic_t _mapcount;                  // line 430
+            atomic_t _refcount;                  // line 431
         };
-        struct page page;                       // line 445 — same memory!
+        struct page page;                        // line 445 — same memory!
     };
-    // second cacheline for large folios:
-    atomic_t _large_mapcount;                   // line 454
-    atomic_t _nr_pages_mapped;                  // line 455
+    // Second cacheline: for large folios only
+    atomic_t _large_mapcount;                    // line 454
+    atomic_t _nr_pages_mapped;                   // line 455
 };
 ```
 
-`page_folio(page)` is just a cast. No allocation, no indirection.
+**Why folios exist.** Before folios, compound pages (multiple contiguous pages treated as one unit — THP, hugetlb) required constant `compound_head()` checks: find the head page before accessing metadata like `mapping` or `index`, which are stored only on the head. Forgetting this check was a recurring source of bugs, because the code compiled and ran fine when the caller happened to pass a head page but silently corrupted state when given a tail page.
 
-### The Page Cache (address_space)
+With folios, the type system enforces the invariant:
+
+```c
+// Function takes a folio — guaranteed to be the head page
+void some_function(struct folio *folio) {
+    folio->mapping;  // safe, no compound_head() needed
+}
+```
+
+A folio of order 0 is a single 4KB page. A folio of order 4 is 16 contiguous pages (64KB). Large folios reduce per-page overhead: one order-4 folio has one LRU entry, one refcount, one dirty check instead of 16 of each. This matters for THP performance and for modern "large folio" work in the filesystem layer.
+
+The transition from `struct page *` to `struct folio *` is still ongoing. Much of mm/ now uses folios; some older code still deals in raw pages. `page_folio(page)` bridges the two. When you see both types in the same function, the pattern is usually: take a page from a tracepoint or legacy callsite, immediately convert to folio for all real work.
+
+`page_folio(page)` is a cast — no allocation, no indirection — because the first bytes of a folio are exactly the bytes of its head page.
+
+### 4.10 The Page Cache (address_space)
 
 Every file that has been read or mmap'd has an `address_space` struct that acts as a cache of the file's contents in RAM. This is the **page cache** — the single most important performance feature in the kernel.
 
@@ -287,9 +921,89 @@ folio = filemap_get_folio(mapping, index);
 
 If the page is there (cache hit), no disk I/O is needed — the data is already in RAM. If it is not there (cache miss), the kernel allocates a fresh page, reads the data from disk into it, and inserts it into the page cache for next time. On a typical system, page cache hit rates are 95-99%.
 
-The `i_mmap` rbtree tracks all VMAs that map this file. This is the **reverse mapping** for file pages — given a page, the kernel can find all processes that have it mapped (by looking up the page in `mapping->i_mmap`), which is essential during reclaim when the kernel needs to unmap pages from all processes before freeing them.
+**The page cache has no fixed size.** It grows to fill unused RAM. When processes need memory, reclaim shrinks it by evicting clean pages (dirty pages are written back first). This is why a freshly-booted Linux system with 16GB RAM shows 90% "used" memory — most of it is page cache, which is trivially reclaimable when an application wants RAM.
 
-### struct bio — the I/O descriptor
+**mmap vs read():**
+
+```
+mmap:   PTE points directly at page cache page. Zero copying.
+        200 processes mapping libc = 1 copy in RAM.
+
+read(): kernel copies data from page cache to userspace buffer.
+        200 processes reading libc = 1 cache copy + 200 buffer copies.
+```
+
+This is why dynamic linkers use mmap for shared libraries — one copy of libc shared by every process. Tools like `vmtouch` and `fincore` (Part 6) let you observe page cache residency directly.
+
+### 4.11 The i_mmap Reverse Map
+
+The `i_mmap` field in `struct address_space` is an **interval rbtree** of all VMAs mapping this file. Keyed by file offset range (`vm_pgoff` to `vm_pgoff + nr_pages`). It answers: "which VMAs overlap file page X?"
+
+```
+libc.so mapped by 3 processes:
+  Process A: vm_start=0x7f000000, vm_pgoff=0   (pages 0–255)
+  Process B: vm_start=0x40000000, vm_pgoff=0   (pages 0–255)
+  Process C: vm_start=0x80000000, vm_pgoff=128 (pages 128–143)
+
+Query: which VMAs contain page 130?
+  A: 0–255 → yes
+  B: 0–255 → yes
+  C: 128–143 → yes
+  All three.
+```
+
+For each matching VMA, compute the virtual address:
+
+```
+virtual_addr = vm_start + (page_index - vm_pgoff) × PAGE_SIZE
+```
+
+Then walk that process's page table to find and clear the PTE.
+
+**Why not a hash table.** Hash tables do exact match. The question is "which VMAs overlap page 130?" — a range query. VMA (pgoff 0–255) contains page 130, but hashing 130 would never find it. An interval rbtree is the right data structure because it supports efficient range containment queries.
+
+**Why this matters for reclaim.** Before the kernel can free a file-backed page, it must clear every PTE that points to it. Without `i_mmap`, finding those PTEs would require scanning every process's page tables — impractical. With `i_mmap`, the kernel walks a small set of VMAs and for each one clears exactly one PTE. This is what `try_to_unmap` does in the reclaim path (Part 11).
+
+### 4.12 Anonymous Reverse Mapping (anon_vma)
+
+Anonymous pages have no file, no `address_space`, no `i_mmap`. Instead, the `mapping` field (with bit 0 set) points to an `anon_vma` — a structure linking all VMAs that might share this anonymous page.
+
+Sharing happens via fork: parent and child both have PTEs pointing to the same physical page.
+
+```c
+// include/linux/rmap.h:32
+struct anon_vma {
+    struct anon_vma *root;        /* Root of this anon_vma tree */
+    struct rw_semaphore rwsem;    /* Serialize access to vma list */
+    atomic_t refcount;
+    // ...
+    struct rb_root_cached rb_root; /* Interval tree of anon_vma_chain */
+};
+
+// include/linux/rmap.h:83
+struct anon_vma_chain {
+    struct vm_area_struct *vma;
+    struct anon_vma *anon_vma;
+    struct list_head same_vma;   /* linked list of anon_vma_chains */
+    struct rb_node rb;           /* interval tree node */
+    unsigned long rb_subtree_last;
+};
+```
+
+Visualizing the relationship:
+
+```
+folio (anon page)
+  └── mapping (bit 0 set) → anon_vma
+                              ├── anon_vma_chain → process A's VMA
+                              └── anon_vma_chain → process B's VMA (added at fork)
+```
+
+For anonymous pages, `folio->index` stores the virtual page number (not a file offset). During reverse mapping, this is used to compute the virtual address in each VMA that might map the page.
+
+The `anon_vma_chain` indirection exists because of `fork()`: the child's VMA links back to the parent's `anon_vma` (so pages allocated before the fork can still be found in both processes) while also getting its own `anon_vma` for pages allocated after (so later COW copies don't pollute the parent's tree). This "tree of anon_vmas" is one of the more intricate parts of the mm subsystem — the brief `struct anon_vma { struct anon_vma *root; ...}` field is what stitches it together.
+
+### 4.13 struct bio — the I/O descriptor
 
 When the kernel needs to actually read or write disk sectors, it constructs a `bio`:
 
@@ -321,9 +1035,208 @@ struct bio_vec {
 
 Multiple `bio` structs can be merged into a single `request` by the block layer's I/O scheduler, which batches adjacent disk operations for efficiency.
 
+### 4.14 How Everything Connects
+
+Here is the graph of pointers that tie these structures together. The tracer in Part 16 traverses this graph constantly, so it is worth burning into memory:
+
+```
+Finding the folio from the file:
+  inode → address_space → i_pages xarray → folio
+
+Finding the file from the folio:
+  folio → mapping → address_space → host → inode
+
+Finding the folio from a virtual address:
+  mm → page table → PTE → PFN → pfn_to_page() → struct page → folio
+
+Finding all processes mapping a folio:
+  File:  folio → mapping → i_mmap rbtree → VMAs → compute addr → PTEs
+  Anon:  folio → mapping & ~1 → anon_vma → chain → VMAs → compute addr → PTEs
+```
+
+Every arrow is bidirectional. This connectivity is what makes reclaim, migration, COW, and sharing possible. Lose any one of these pointers and the whole system breaks: without `i_mmap`, reclaim cannot unmap file pages; without `anon_vma`, it cannot unmap anonymous pages; without `mapping` on the folio, it cannot find the owning file to remove the page cache entry; without `_mapcount`, COW cannot decide whether to reuse or copy.
+
+Every one of these pointers is updated atomically with respect to the others, using a combination of spinlocks (for fast-path updates like PTE installation), RCU (for readers walking the trees), and RW semaphores (for long-duration operations like mmap). Part 14 dissects the locking discipline.
+
+### 4.15 Key Identity Relationships Summary
+
+```
+Physical address ←→ PFN:       just bit shift by 12
+PFN ←→ struct page:             array indexing (mem_map[pfn])
+Virtual address → PFN:          4-level page table walk (MMU or kernel)
+PFN → virtual addresses:        reverse mapping (i_mmap or anon_vma)
+File + offset → folio:          page cache xarray lookup
+Folio → file + offset:          folio->mapping + folio->index
+VMA → page table:               VMA provides address range, walk mm->pgd
+Process → VMAs:                 mm_struct → maple tree
+```
+
+Keep this table handy. When reading later chapters, if you lose track of how some piece of information is being derived, come back here.
+
 ---
 
-## Part 3: The Page Fault — Where Everything Starts
+## Part 5: Process Memory Lifecycle — fork, COW, and the Zero Page
+
+### 5.1 What fork() Actually Copies
+
+```
+Copied:
+  mm_struct                 new allocation, independent
+  All VMAs                  independent copies, same values
+  Entire page table tree    all levels including leaf PTEs
+  Leaf PTE values           same PFNs, but marked READ-ONLY (COW setup)
+
+NOT copied:
+  Physical data pages       shared, mapcount incremented
+  struct page descriptors   global array, just update mapcount
+
+Cost: proportional to VMAs + page table pages (~1–2MB for a typical process)
+Not proportional to data (~hundreds of MB)
+```
+
+A process using 500MB of RAM forks in milliseconds because only the metadata — VMAs, page tables — is copied. The 500MB of data is shared until one of the processes writes.
+
+### 5.2 Copy-on-Write (COW)
+
+After fork, both parent and child PTEs point to the same physical pages, marked read-only. When either writes:
+
+1. Write fault (PTE is read-only).
+2. Kernel checks VMA — `VM_WRITE` is set, so this is a COW fault, not a violation.
+3. Check `_mapcount` — if > 0 (shared), must copy.
+4. Allocate new physical page from buddy allocator.
+5. Copy 4096 bytes from old page to new page.
+6. Update the writer's PTE to point to new page, set writable.
+7. If old page's mapcount drops to 0 (exclusive to the other process), make the other's remaining PTE writable too — avoid a second, pointless fault.
+
+If the VMA doesn't have `VM_WRITE`: SIGSEGV. The PTE alone doesn't carry enough information — the VMA determines whether a write fault is COW or a real permission violation.
+
+We dig into the exact code in Part 8 (Anonymous Memory and Copy-on-Write), including the TLB-flush ordering that prevents two CPUs from seeing different mappings during the transition.
+
+### 5.3 vfork() and posix_spawn()
+
+`fork() + exec()` is wasteful. All that VMA and page table copying is thrown away the moment `exec()` destroys the address space.
+
+**`vfork()`** skips all copying — child shares parent's `mm_struct` directly, parent is suspended until the child calls `exec()` or `_exit()`. This is brutally fast (microseconds regardless of process size) but dangerous: child must only call those two things. Any other operation (malloc, setenv, return) corrupts the parent's memory because they share it.
+
+**`posix_spawn()`** wraps vfork safely with a declarative interface — you describe what to do between fork and exec (close fds, redirect I/O, set signals) and the kernel does it. No application code runs in the shared address space, so no corruption risk. Android's `Zygote` process uses a similar fork-based model with careful discipline about what runs between fork and the first dalvik class initialization.
+
+### 5.4 Anonymous Page Allocation
+
+When a process first writes to anonymous memory:
+
+**Read fault on anonymous memory:** the kernel maps the shared **zero page** — one system-wide, read-only page of zeros, at a well-known PFN (`zero_pfn`, defined at `mm/memory.c:165`).
+
+```c
+// mm/memory.c:163
+unsigned long zero_pfn __read_mostly;
+EXPORT_SYMBOL(zero_pfn);
+```
+
+Every process's unwritten anonymous pages point to this same zero page. `malloc(1GB)` followed by reading the memory costs zero physical RAM — a read fault installs a read-only PTE pointing to `zero_pfn`, and the data (all zeros) is already there. This is why `top` can show a process with 1GB `VSZ` but only a few MB `RSS`.
+
+**Write fault on anonymous memory:** allocate a real zeroed page from the buddy allocator. Born dirty (no on-disk copy). Set up anon_vma reverse mapping. Add to LRU. The PTE is replaced with one pointing to the new page, writable.
+
+If the original PTE pointed to the zero page (a prior read fault), this is a COW-from-zero: the zero page's mapcount is not incremented (it's shared globally, tracking would be pointless), and the new page is allocated and zeroed anyway.
+
+### 5.5 tmpfs / shmem — The In-Between
+
+tmpfs has `vm_file != NULL` — structurally file-backed with an inode, address_space, and page cache. But its pages go to swap on reclaim (like anonymous), not to disk (like regular files), and the file disappears when the filesystem is unmounted.
+
+```
+                Regular file      tmpfs/shmem        Anonymous
+Backing store:  disk              swap/zram          swap/zram
+vm_file:        yes               yes                NULL
+Page cache:     yes               yes                no
+vm_ops->fault:  filemap_fault     shmem_fault        NULL (hardcoded path)
+Survives reboot: yes              no                 no
+```
+
+This hybrid is useful for inter-process shared memory (POSIX `shm_open`, System V `shmget`), GPU drivers' mappings, and Android's `ashmem` (anonymous shared memory). The tracer needs to know about it because shmem pages look file-backed to most of the mm code but behave like anonymous pages during reclaim.
+
+---
+
+## Part 6: Observing the Page Cache — Tools of the Trade
+
+Before you build a complex eBPF tracer, learn what's already available. Many questions about page cache residency and memory use have answers in `/proc` and existing tools.
+
+### 6.1 System-wide
+
+```bash
+cat /proc/meminfo | grep -E "Cached|Buffers"
+# Cached: file-backed page cache
+# Buffers: cache of raw block device reads (usually small)
+```
+
+`/proc/meminfo` is the quickest way to see how much memory is in the page cache vs other uses. `MemAvailable` is an estimate of how much can be allocated without swapping — includes reclaimable cache.
+
+### 6.2 Per-file
+
+```bash
+vmtouch -v /usr/lib/*.so*           # cache residency per file
+fincore /usr/lib/libc.so.6          # pages cached / total pages
+```
+
+`vmtouch` can also *pin* pages in cache (`vmtouch -t` = touch = cache, `vmtouch -l` = lock in RAM). Useful for pre-warming caches before a benchmark.
+
+### 6.3 Per-process page info
+
+```bash
+cat /proc/pid/maps                    # VMAs (no root needed)
+cat /proc/pid/pagemap                 # PTE-level info (binary, root for PFNs)
+cat /proc/kpageflags                  # flags per PFN (root)
+cat /proc/kpagecount                  # mapcount per PFN (root)
+sudo tools/mm/page-types -p PID       # categorized page breakdown
+```
+
+`/proc/pid/pagemap` gives you one 64-bit entry per virtual page:
+- Bits 0–54: the PFN (if the page is present in RAM).
+- Bit 61: page is file-backed or shared anonymous.
+- Bit 62: page is swapped.
+- Bit 63: page is present.
+
+Since kernel 4.0, reading PFNs requires `CAP_SYS_ADMIN` — rowhammer mitigation.
+
+### 6.4 Programmatically
+
+```c
+#include <sys/mman.h>
+
+void *addr = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+unsigned char *vec = malloc(size / 4096);
+mincore(addr, size, vec);
+// vec[i] & 1 == 1  →  virtual page i is in the page cache
+// vec[i] & 1 == 0  →  accessing it would fault
+```
+
+`mincore` doesn't require root — it tells you about your own mapping. Use it to decide whether a read will be cheap (cache hit) or expensive (disk read).
+
+### 6.5 Drop the cache
+
+```bash
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+```
+
+- `1` drops the page cache.
+- `2` drops slab reclaimable objects (dentries, inodes).
+- `3` drops both.
+
+Only clean pages are dropped. Dirty pages skipped — they'd need writeback first. This is useful before benchmarks ("make sure the next read goes to disk") and for debugging cache behavior. Don't use it in production; you'll just force re-reads.
+
+### 6.6 The "Free" Number Is Misleading
+
+The `free` command shows a "free" column that seems too low and a "used" column that seems too high. This is because the page cache counts as "used" in the top row.
+
+```
+$ free -h
+              total   used   free   shared  buff/cache   available
+Mem:          16Gi    11Gi   1Gi    500Mi   4Gi          4Gi
+```
+
+Here, `used - buff/cache ≈ actual allocation` (7GB), and `available ≈ 4GB` is what an allocation can grow into by reclaiming cache. This is normal and healthy — empty RAM is wasted RAM. The kernel keeps the cache hot until something needs the memory more.
+
+---
+
+## Part 7: The Page Fault — Where Everything Starts
 
 When your program accesses a virtual address that has no page table entry, or has one with insufficient permissions, the CPU raises a page fault. This is not an error — it is the normal mechanism by which the kernel populates memory on demand. Most pages in a process are set up lazily: `mmap()` creates the VMA (the description of the mapping) but does not allocate any physical pages or page table entries. The first access triggers a fault, and the fault handler does the actual work.
 
@@ -544,7 +1457,7 @@ Notice the **re-check under lock**. Between the time `filemap_fault` found the p
 
 ---
 
-## Part 4: Anonymous Memory and Copy-on-Write
+## Part 8: Anonymous Memory and Copy-on-Write
 
 ### Anonymous page allocation
 
@@ -664,7 +1577,7 @@ The sequence is: clear old PTE and flush TLB → install new PTE → remove old 
 
 ---
 
-## Part 5: Dirty Pages and Writeback — Getting Data to Disk
+## Part 9: Dirty Pages and Writeback — Getting Data to Disk
 
 When a process writes to a `MAP_SHARED` file mapping, or when the kernel writes to a page cache page on behalf of a `write()` syscall, the page becomes **dirty** — its in-memory contents differ from what is on disk. The kernel tracks dirty pages and periodically writes them back to the filesystem.
 
@@ -749,7 +1662,7 @@ The `folio_wake_bit` call is important — other parts of the kernel (like `fsyn
 
 ---
 
-## Part 6: The Block I/O Layer — From Pages to Sectors
+## Part 10: The Block I/O Layer — From Pages to Sectors
 
 The block layer sits between the filesystem and the disk driver. Its job is to take `bio` structs from the filesystem and deliver them to the hardware efficiently. This section traces the full read and write paths from userspace syscalls down to hardware and back, because you cannot build a useful tracer without understanding both directions.
 
@@ -1096,7 +2009,7 @@ static void mpage_write_end_io(struct bio *bio)
 }
 ```
 
-The `folio_end_writeback` call (Part 5 traced this at `mm/filemap.c:1681`) clears `PG_writeback` and wakes anyone sleeping in `folio_wait_writeback` — typically an `fsync()` caller waiting for their data to hit disk.
+The `folio_end_writeback` call (Part 9 traced this at `mm/filemap.c:1681`) clears `PG_writeback` and wakes anyone sleeping in `folio_wait_writeback` — typically an `fsync()` caller waiting for their data to hit disk.
 
 ### The full read/write cycle, visualized
 
@@ -1161,11 +2074,11 @@ trace_block_rq_issue(rq);
 trace_block_rq_complete(req, BLK_STS_OK, total_bytes);
 ```
 
-The challenge for our tracer: both tracepoints carry sector information (dev, sector, nr_sectors) but not PFN. To connect an I/O event back to a page, we need to record the (dev, sector) → page_id mapping *at bio construction time* (when we still have the folio). Part 12 shows exactly how.
+The challenge for our tracer: both tracepoints carry sector information (dev, sector, nr_sectors) but not PFN. To connect an I/O event back to a page, we need to record the (dev, sector) → page_id mapping *at bio construction time* (when we still have the folio). Part 16 shows exactly how.
 
 ---
 
-## Part 7: Reclaim — How the Kernel Takes Memory Back
+## Part 11: Reclaim — How the Kernel Takes Memory Back
 
 When the system is running low on free memory, the kernel needs to reclaim pages. It does this through a background daemon called `kswapd` (one per NUMA node) and through **direct reclaim** in the allocation path when `kswapd` cannot keep up.
 
@@ -1348,7 +2261,7 @@ trace_mm_page_free(page, order);
 
 ---
 
-## Part 8: zRAM — Android's Swap Trick
+## Part 12: zRAM — Android's Swap Trick
 
 Traditional desktop Linux uses swap partitions — when anonymous pages are evicted, they are written to a dedicated area on disk. Android does not do this. Writing to flash storage is slow (relative to RAM), wears out the flash, and modern phones have plenty of RAM to compress into.
 
@@ -1405,7 +2318,7 @@ When the page is needed again (a swap fault), `zram_read_page` decompresses it b
 
 ---
 
-## Part 9: Page Migration — Moving Pages Without Anyone Noticing
+## Part 13: Page Migration — Moving Pages Without Anyone Noticing
 
 Sometimes the kernel needs to move a page from one physical address to another without changing any process's view of memory. This happens during:
 
@@ -1451,11 +2364,11 @@ The `remove_migration_ptes` call is the tricky part. During migration:
 
 If a process tries to access the page during step 2, it faults. The fault handler sees the migration entry, sleeps until migration completes, then retries. The process never knows its page moved — it just experiences a brief stall.
 
-**Why migration matters for tracing.** If you are tracking pages by PFN, migration breaks your tracking. The PFN changes, but it is logically the same page with the same data and the same owner. Any tracer that uses PFN as a key needs to handle migration or it will lose pages. This is one of the harder problems in building a page lifecycle tracer, and we address it in Part 12.
+**Why migration matters for tracing.** If you are tracking pages by PFN, migration breaks your tracking. The PFN changes, but it is logically the same page with the same data and the same owner. Any tracer that uses PFN as a key needs to handle migration or it will lose pages. This is one of the harder problems in building a page lifecycle tracer, and we address it in Part 16.
 
 ---
 
-## Part 10: Synchronization — How the mm Subsystem Stays Sane
+## Part 14: Synchronization — How the mm Subsystem Stays Sane
 
 Multiple CPUs can fault on the same page simultaneously. Reclaim can try to evict a page while a process is mapping it. Writeback can be writing a page while the process is dirtying it again. The mm subsystem uses a layered locking strategy to handle all of this.
 
@@ -1551,7 +2464,7 @@ This pattern minimizes the time locks are held, which is critical for scalabilit
 
 ---
 
-## Part 11: eBPF — Observing the Kernel From the Inside
+## Part 15: eBPF — Observing the Kernel From the Inside
 
 eBPF lets you run small programs inside the kernel, safely, without modifying the kernel source or loading traditional kernel modules. Originally designed as a packet filter in 1992, it has been rebuilt into a general-purpose instrumentation framework that powers tracing, networking, security, and scheduling on every modern Linux system.
 
@@ -1985,7 +2898,7 @@ End-to-end, a well-written BPF handler on a hot tracepoint adds 100-500ns of ove
 
 ---
 
-## Part 12: Building a Page Lifecycle Tracer with eBPF
+## Part 16: Building a Page Lifecycle Tracer with eBPF
 
 Now we put it all together. The goal: track every physical page from allocation through page cache insertion, fault, dirty, writeback, I/O, and free. Userspace reads a stream of events from the BPF ring buffer and can reconstruct any page's history at any point.
 
@@ -2483,7 +3396,7 @@ int on_bio_add_folio(struct pt_regs *ctx) {
     struct bio *bio = (struct bio *)PT_REGS_PARM1(ctx);
     struct folio *folio = (struct folio *)PT_REGS_PARM2(ctx);
 
-    // Extract PFN from folio (same challenge as elsewhere — see Part 12
+    // Extract PFN from folio (same challenge as elsewhere — see Part 16
     // notes on folio_to_pfn_helper)
     unsigned long pfn = folio_to_pfn_helper(folio);
     u64 page_id = get_page_id(pfn);
@@ -3142,7 +4055,7 @@ Because events are a stream (not pre-aggregated), userspace has full flexibility
 
 ---
 
-## Part 13: Operating the Tracer — Build, Run, Debug, Tune
+## Part 17: Operating the Tracer — Build, Run, Debug, Tune
 
 The code is written. Now you need to build it, run it, verify it works, and tune it when it doesn't. This part is the operator's guide.
 
@@ -3351,7 +4264,7 @@ Tuning knobs:
 
 ---
 
-## Part 14: Historical Context — How We Got Here
+## Part 18: Historical Context — How We Got Here
 
 ### The evolution of struct page
 
