@@ -70,7 +70,7 @@ Everything is licensed under the kernel's GPL-2.0 terms for the code that is quo
 
 ---
 
-## Part 1: The Hardware Foundation — DRAM, Banks, Channels
+## Part 1: The Hardware Foundation — DRAM, Banks, Channels {#part-1-the-hardware-foundation-dram-banks-channels}
 
 Before any kernel code runs, you have silicon. Understanding what RAM actually *is* at the electrical level changes how you read the rest of this book. Every decision the kernel makes — how pages are sized, why NUMA matters, why DMA needs cache flushes, why rowhammer is a thing — comes from physical constraints of DRAM. Skip this part and later chapters read like arbitrary rules. Read it and they read like inevitable engineering.
 
@@ -219,7 +219,7 @@ Next, we look at the cache hierarchy that sits between the CPU and DRAM, because
 
 ---
 
-## Part 2: The Cache Hierarchy — How the CPU Hides Memory Latency
+## Part 2: The Cache Hierarchy — How the CPU Hides Memory Latency {#part-2-the-cache-hierarchy-how-the-cpu-hides-memory-latency}
 
 DRAM is slow. A CPU core running at 3 GHz completes a cycle in 0.33ns. A DRAM row miss costs ~55–75ns. If the CPU had to wait for every memory access, it would spend ~99% of its time stalled. Caches are how the hardware pretends memory is fast.
 
@@ -430,7 +430,7 @@ Architectures differ significantly: x86 has cache-coherent DMA by default (the f
 
 ---
 
-## Part 3: Virtual Memory and Page Tables — The Translation Machinery
+## Part 3: Virtual Memory and Page Tables — The Translation Machinery {#part-3-virtual-memory-and-page-tables-the-translation-machinery}
 
 We've seen the hardware. Now we look at how the kernel uses it to give each process the illusion of its own isolated, contiguous address space.
 
@@ -564,7 +564,7 @@ On Android, where a process has many shared libraries and mmap'd files scattered
 
 ---
 
-## Part 4: Kernel Data Structures — How Memory Is Described
+## Part 4: Kernel Data Structures — How Memory Is Described {#part-4-kernel-data-structures-how-memory-is-described}
 
 Five data structures form the backbone of the mm subsystem. Everything else builds on these, so it is worth spending time here. Read this section slowly. The tracer we build in Part 16 reaches into almost every one of these structures, and any hand-wave here becomes a bug there.
 
@@ -1075,7 +1075,7 @@ Keep this table handy. When reading later chapters, if you lose track of how som
 
 ---
 
-## Part 5: Process Memory Lifecycle — fork, COW, and the Zero Page
+## Part 5: Process Memory Lifecycle — fork, COW, and the Zero Page {#part-5-process-memory-lifecycle-fork-cow-and-the-zero-page}
 
 ### 5.1 What fork() Actually Copies
 
@@ -1155,7 +1155,7 @@ This hybrid is useful for inter-process shared memory (POSIX `shm_open`, System 
 
 ---
 
-## Part 6: Observing the Page Cache — Tools of the Trade
+## Part 6: Observing the Page Cache — Tools of the Trade {#part-6-observing-the-page-cache-tools-of-the-trade}
 
 Before you build a complex eBPF tracer, learn what's already available. Many questions about page cache residency and memory use have answers in `/proc` and existing tools.
 
@@ -1236,7 +1236,7 @@ Here, `used - buff/cache ≈ actual allocation` (7GB), and `available ≈ 4GB` i
 
 ---
 
-## Part 7: The Page Fault — Where Everything Starts
+## Part 7: The Page Fault — Where Everything Starts {#part-7-the-page-fault-where-everything-starts}
 
 When your program accesses a virtual address that has no page table entry, or has one with insufficient permissions, the CPU raises a page fault. This is not an error — it is the normal mechanism by which the kernel populates memory on demand. Most pages in a process are set up lazily: `mmap()` creates the VMA (the description of the mapping) but does not allocate any physical pages or page table entries. The first access triggers a fault, and the fault handler does the actual work.
 
@@ -1457,7 +1457,7 @@ Notice the **re-check under lock**. Between the time `filemap_fault` found the p
 
 ---
 
-## Part 8: Anonymous Memory and Copy-on-Write
+## Part 8: Anonymous Memory and Copy-on-Write {#part-8-anonymous-memory-and-copy-on-write}
 
 ### Anonymous page allocation
 
@@ -1577,7 +1577,7 @@ The sequence is: clear old PTE and flush TLB → install new PTE → remove old 
 
 ---
 
-## Part 9: Dirty Pages and Writeback — Getting Data to Disk
+## Part 9: Dirty Pages and Writeback — Getting Data to Disk {#part-9-dirty-pages-and-writeback-getting-data-to-disk}
 
 When a process writes to a `MAP_SHARED` file mapping, or when the kernel writes to a page cache page on behalf of a `write()` syscall, the page becomes **dirty** — its in-memory contents differ from what is on disk. The kernel tracks dirty pages and periodically writes them back to the filesystem.
 
@@ -1687,7 +1687,7 @@ The `folio_wake_bit` call is important — other parts of the kernel (like `fsyn
 
 ---
 
-## Part 10: The Block I/O Layer — From Pages to Sectors
+## Part 10: The Block I/O Layer — From Pages to Sectors {#part-10-the-block-io-layer-from-pages-to-sectors}
 
 The block layer sits between the filesystem and the disk driver. Its job is to take `bio` structs from the filesystem and deliver them to the hardware efficiently. This section traces the full read and write paths from userspace syscalls down to hardware and back, because you cannot build a useful tracer without understanding both directions.
 
@@ -2103,7 +2103,7 @@ The challenge for our tracer: both tracepoints carry sector information (dev, se
 
 ---
 
-## Part 11: Reclaim — How the Kernel Takes Memory Back
+## Part 11: Reclaim — How the Kernel Takes Memory Back {#part-11-reclaim-how-the-kernel-takes-memory-back}
 
 When the system is running low on free memory, the kernel needs to reclaim pages. It does this through a background daemon called `kswapd` (one per NUMA node) and through **direct reclaim** in the allocation path when `kswapd` cannot keep up.
 
@@ -2286,7 +2286,7 @@ trace_mm_page_free(page, order);
 
 ---
 
-## Part 12: zRAM — Android's Swap Trick
+## Part 12: zRAM — Android's Swap Trick {#part-12-zram-androids-swap-trick}
 
 Traditional desktop Linux uses swap partitions — when anonymous pages are evicted, they are written to a dedicated area on disk. Android does not do this. Writing to flash storage is slow (relative to RAM), wears out the flash, and modern phones have plenty of RAM to compress into.
 
@@ -2434,7 +2434,7 @@ So the tracer can observe "page PFN=X was handed to zRAM" (via a `zram_write_pag
 
 ---
 
-## Part 13: Page Migration — Moving Pages Without Anyone Noticing
+## Part 13: Page Migration — Moving Pages Without Anyone Noticing {#part-13-page-migration-moving-pages-without-anyone-noticing}
 
 Sometimes the kernel needs to move a page from one physical address to another without changing any process's view of memory. This happens during:
 
@@ -2539,7 +2539,7 @@ The batch design exists because the per-folio work has fixed overhead (lock acqu
 
 ---
 
-## Part 14: Synchronization — How the mm Subsystem Stays Sane
+## Part 14: Synchronization — How the mm Subsystem Stays Sane {#part-14-synchronization-how-the-mm-subsystem-stays-sane}
 
 Multiple CPUs can fault on the same page simultaneously. Reclaim can try to evict a page while a process is mapping it. Writeback can be writing a page while the process is dirtying it again. The mm subsystem uses a layered locking strategy to handle all of this.
 
@@ -2635,7 +2635,7 @@ This pattern minimizes the time locks are held, which is critical for scalabilit
 
 ---
 
-## Part 15: eBPF — Observing the Kernel From the Inside
+## Part 15: eBPF — Observing the Kernel From the Inside {#part-15-ebpf-observing-the-kernel-from-the-inside}
 
 eBPF lets you run small programs inside the kernel, safely, without modifying the kernel source or loading traditional kernel modules. Originally designed as a packet filter in 1992, it has been rebuilt into a general-purpose instrumentation framework that powers tracing, networking, security, and scheduling on every modern Linux system.
 
@@ -3069,7 +3069,7 @@ End-to-end, a well-written BPF handler on a hot tracepoint adds 100-500ns of ove
 
 ---
 
-## Part 16: Building a Page Lifecycle Tracer with eBPF
+## Part 16: Building a Page Lifecycle Tracer with eBPF {#part-16-building-a-page-lifecycle-tracer-with-ebpf}
 
 Now we put it all together. The goal: track every physical page from allocation through page cache insertion, fault, dirty, writeback, I/O, and free. Userspace reads a stream of events from the BPF ring buffer and can reconstruct any page's history at any point.
 
@@ -4226,7 +4226,7 @@ Because events are a stream (not pre-aggregated), userspace has full flexibility
 
 ---
 
-## Part 17: Operating the Tracer — Build, Run, Debug, Tune
+## Part 17: Operating the Tracer — Build, Run, Debug, Tune {#part-17-operating-the-tracer-build-run-debug-tune}
 
 The code is written. Now you need to build it, run it, verify it works, and tune it when it doesn't. This part is the operator's guide.
 
@@ -4435,7 +4435,7 @@ Tuning knobs:
 
 ---
 
-## Part 18: Historical Context — How We Got Here
+## Part 18: Historical Context — How We Got Here {#part-18-historical-context-how-we-got-here}
 
 ### The evolution of struct page
 
