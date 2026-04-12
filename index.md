@@ -1624,14 +1624,39 @@ xa_unlock_irqrestore(&mapping->i_pages, flags);
 
 The `PAGECACHE_TAG_DIRTY` mark is what makes writeback efficient. Instead of scanning every page in the cache to find dirty ones, the writeback code can use `xas_find_marked()` to jump directly to tagged entries. For a file with 10,000 cached pages and only 5 dirty ones, this saves examining 9,995 entries.
 
-### The writeback thread
+### The three triggers of writeback
 
-The kernel has a background writeback thread (`kworker/u:flush-*`) that periodically wakes up and writes dirty pages back to their filesystems. The wakeup is controlled by two sysctl parameters:
+Dirty pages get written back from three sources. All three converge on the same filesystem callback (`a_ops->writepages`), but they start in different places:
 
-- `dirty_expire_centisecs` (default 3000 = 30 seconds): How long a page must be dirty before writeback picks it up.
-- `dirty_writeback_centisecs` (default 500 = 5 seconds): How often the writeback thread wakes up to check.
+**1. Background timer.** The kernel has a background writeback thread (`kworker/u:flush-*`) per backing device. It periodically wakes up and writes dirty pages back to their filesystems. Two sysctl parameters control it:
 
-Writeback also triggers eagerly when the total amount of dirty memory exceeds a threshold (`dirty_ratio` or `dirty_bytes`). This prevents a sudden burst of writes from consuming all available RAM with dirty pages.
+- `dirty_expire_centisecs` (default 3000 = 30 seconds): how long a page must be dirty before writeback picks it up.
+- `dirty_writeback_centisecs` (default 500 = 5 seconds): how often the writeback thread wakes up to check.
+
+**2. Dirty memory pressure.** If the total amount of dirty memory grows too large, processes that are still dirtying pages get throttled inside `balance_dirty_pages` at `mm/page-writeback.c`. This is the "dirty budget" mechanism:
+
+- `vm_dirty_ratio` (default 20 = 20% of available memory): hard cap — processes block in `balance_dirty_pages` when this is exceeded.
+- `dirty_background_ratio` (default 10): soft cap — background writeback accelerates when this is exceeded.
+
+From `mm/page-writeback.c:92`:
+
+```c
+static int vm_dirty_ratio = 20;
+```
+
+The ratios apply to *dirtyable* memory (free memory + reclaimable cache), not total RAM. The purpose is to prevent one greedy writer from filling all available RAM with dirty pages — which would then take minutes to drain to a slow disk, starving everyone else.
+
+**3. Explicit sync.** `fsync()`, `fdatasync()`, `sync()`, and `msync()` all call into `filemap_write_and_wait_range` at `mm/filemap.c:675`, which immediately initiates writeback and then waits for it to complete. This is the only writeback path that blocks the caller until the data is on stable storage.
+
+### Per-backing-device accounting
+
+Writeback is per-backing-device (per `struct bdi_writeback`), not global. Each disk or file system has its own dirty accounting and its own writeback thread, so a slow USB drive cannot stall writeback to a fast NVMe. Each backing device tracks:
+
+- Number of pages dirty on this BDI.
+- Number of pages currently under writeback on this BDI.
+- Write bandwidth estimate (updated in `wb_bandwidth_estimate_start`).
+
+The bandwidth estimate feeds back into `balance_dirty_pages`: slower devices cause earlier throttling of their dirtying processes, so fast devices don't suffer because of a slow one.
 
 The writeback path calls the filesystem's `writepages` callback, which builds `bio` structures containing the dirty pages and submits them to the block layer. After the I/O completes, `folio_end_writeback` at `mm/filemap.c:1681` clears the writeback flag:
 
@@ -2312,9 +2337,100 @@ There are three fast paths here:
 2. **Compressible page**: The page compresses to less than `huge_class_size` (typically 75% of page size). This is the normal case for text, DOM data, Java objects.
 3. **Incompressible page**: Media buffers, encrypted data, already-compressed data. Stored uncompressed, which is wasteful. This is why apps with lots of media tend to be poor zRAM citizens.
 
-The compression ratio (total compressed size / total original size) is the key metric. On a typical Android phone, it is around 0.3-0.4, meaning you get 2.5-3x effective RAM capacity from zRAM.
+The compression ratio (total compressed size / total original size) is the key metric. On a typical Android phone, it is around 0.3–0.4, meaning you get 2.5–3× effective RAM capacity from zRAM.
 
-When the page is needed again (a swap fault), `zram_read_page` decompresses it back into a fresh physical page. The decompression is typically faster than the compression — lz4 decompression runs at several GB/s on ARM64.
+### The read path
+
+When the page is needed again (a swap fault), the kernel asks zRAM to bring it back. `read_from_zspool` at `drivers/block/zram/zram_drv.c:2118` dispatches based on how the page was stored:
+
+```c
+static int read_from_zspool(struct zram *zram, struct page *page, u32 index)
+{
+    if (test_slot_flag(zram, index, ZRAM_SAME) ||
+        !get_slot_handle(zram, index))
+        return read_same_filled_page(zram, page, index);
+
+    if (!test_slot_flag(zram, index, ZRAM_HUGE))
+        return read_compressed_page(zram, page, index);
+    else
+        return read_incompressible_page(zram, page, index);
+}
+```
+
+The three cases mirror the three write cases:
+
+- **ZRAM_SAME**: the page was stored as a single repeated value. Just fill the new page with that value. Essentially free.
+- **Compressed (default)**: decompress into the new page via `read_compressed_page` at `drivers/block/zram/zram_drv.c:2063`.
+- **ZRAM_HUGE (incompressible)**: copy the stored raw bytes directly.
+
+The compressed case does the real work:
+
+```c
+static int read_compressed_page(struct zram *zram, struct page *page, u32 index)
+{
+    handle = get_slot_handle(zram, index);
+    size = get_slot_size(zram, index);
+    prio = get_slot_comp_priority(zram, index);
+
+    zstrm = zcomp_stream_get(zram->comps[prio]);
+    src = zs_obj_read_begin(zram->mem_pool, handle, size, zstrm->local_copy);
+    dst = kmap_local_page(page);
+    ret = zcomp_decompress(zram->comps[prio], zstrm, src, size, dst);
+    kunmap_local(dst);
+    zs_obj_read_end(zram->mem_pool, handle, size, src);
+    zcomp_stream_put(zstrm);
+
+    return ret;
+}
+```
+
+Notice `prio = get_slot_comp_priority(zram, index)`. zRAM can be configured with multiple compression backends simultaneously (e.g., lz4 as primary for speed, zstd as secondary for ratio). The slot records which backend compressed it, so decompression picks the right codec.
+
+### Compression backends
+
+zRAM supports multiple codecs via `drivers/block/zram/backend_*.c`:
+
+- **lz4**: very fast, modest compression ratio. Default for speed-sensitive workloads.
+- **lz4hc**: slower compression, same decompression speed, better ratio.
+- **zstd**: significantly better ratio than lz4, slower compression but still fast decompression.
+- **deflate**: legacy.
+- **842**: IBM's hardware-accelerated codec (POWER).
+- **lzo / lzo-rle**: older; still in use.
+
+Each backend registers a `zcomp_backend` struct exposing `compress`, `decompress`, and stream-allocation callbacks. The backend selection is a sysfs knob (`/sys/block/zramN/comp_algorithm`).
+
+### zsmalloc: the compressed page allocator
+
+Compressed data doesn't fit into page-size chunks — compressed sizes vary from ~100 bytes to ~4KB. zRAM uses **zsmalloc**, a special slab-like allocator optimized for variable-size objects within a compressed RAM pool.
+
+`zs_malloc(zram->mem_pool, comp_len, ...)` returns a 64-bit **handle** (not a pointer). Handles are stable even if zsmalloc internally moves objects around to defragment. Given a handle, `zs_obj_read_begin` and `zs_obj_write` copy data in and out.
+
+This is why the zRAM tracer cannot naturally follow a page's PFN: once compressed, the data is at a zsmalloc handle, not a PFN. zsmalloc may also split the compressed data across two physical pages (because object sizes aren't aligned to page boundaries), which is why `read_from_zspool_raw` passes `zstrm->local_copy` as a scratch buffer.
+
+### The LLM (Least Recently Mapped) choice
+
+Traditional Linux swap writes evicted pages to a disk block; any subsequent read requires a disk read. zRAM's "swap" is all in RAM, so there's no wear-leveling or I/O wait — just a CPU decompression cost measured in microseconds.
+
+On Android, zRAM is typically sized at 50–200% of physical RAM (the `disksize` parameter). A phone with 8GB RAM might configure 4GB of zRAM. Under pressure, the kernel evicts anonymous pages to zRAM, and the 4GB of compressed pool holds ~12GB of logical page data (at a 0.33 compression ratio). Effective memory: 8GB RAM + 12GB compressed = 20GB worth of working set.
+
+### zRAM writeback
+
+Since kernel 4.14, zRAM supports **writeback** — evicting *compressed* pages to a real disk-backed swap device when the compressed pool itself fills up. Configured via `/sys/block/zramN/backing_dev`. The idea: compressed pages in zRAM are "warm" (recently accessed); if not touched for a while, they get written out to flash. This lets zRAM act as a compression-layer cache in front of traditional swap.
+
+For Android, this is generally disabled (flash wear) but available on servers.
+
+### Why zRAM is hard to trace precisely
+
+For the tracer in Part 16, zRAM is the hardest subsystem to instrument per-page. The flow is:
+
+```
+anonymous page (PFN=X) → reclaim → swap_writeout → zram_bvec_write
+  → zcomp_compress → zs_malloc(pool) → handle=H
+```
+
+After compression, the original PFN is freed. The logical page exists as `(swap_entry, handle H, size S)`. When swap-in happens, a *new* PFN is allocated and `zcomp_decompress` fills it. The old PFN and new PFN have no direct relationship — they are connected only through the swap entry.
+
+So the tracer can observe "page PFN=X was handed to zRAM" (via a `zram_write_page` kprobe) and separately "page PFN=Y came from zRAM" (via a decompression kprobe), but linking them requires tracking the swap entry through the `struct folio`'s `->swap` field during the zram trip. Part 16 discusses this limitation.
 
 ---
 
@@ -2365,6 +2481,61 @@ The `remove_migration_ptes` call is the tricky part. During migration:
 If a process tries to access the page during step 2, it faults. The fault handler sees the migration entry, sleeps until migration completes, then retries. The process never knows its page moved — it just experiences a brief stall.
 
 **Why migration matters for tracing.** If you are tracking pages by PFN, migration breaks your tracking. The PFN changes, but it is logically the same page with the same data and the same owner. Any tracer that uses PFN as a key needs to handle migration or it will lose pages. This is one of the harder problems in building a page lifecycle tracer, and we address it in Part 16.
+
+### Migration entries: the bridge state
+
+Between "old PTE cleared" and "new PTE installed," the PTE is neither absent nor pointing to a real page. It holds a **migration entry** — a special encoded value that tells the fault handler "this page is mid-move, go to sleep."
+
+From the PTE's bit layout (Part 3.4), when bit 0 is 0 (invalid), the kernel reuses the remaining 63 bits for auxiliary data. Migration entries are one such encoding: they record the old PFN and the "this is a migration" type, packed into the invalid PTE slot.
+
+When a fault occurs on a migration entry:
+
+1. `handle_pte_fault` sees `!pte_present(pte)` and calls `do_swap_page` — counterintuitively, because the migration code path is implemented as part of the swap infrastructure.
+2. `do_swap_page` recognizes the migration entry type, calls `migration_entry_wait`, which puts the task to sleep on the folio's migration waitqueue.
+3. When `remove_migration_ptes` finishes installing the new PTEs, it wakes all waiters.
+4. The woken task retries the fault and sees the new PTE.
+
+This is how user processes experience migration as "brief stall" rather than "segfault."
+
+### Compaction: the most common trigger
+
+Memory compaction is the biggest user of migration. The kernel compacts memory to build contiguous free regions for high-order allocations (huge pages, CMA for device buffers, large bio allocations).
+
+`mm/compaction.c` has the compaction loop. The algorithm:
+
+1. Scan memory for movable pages, isolate them.
+2. Migrate each isolated page to a free slot in a contiguous target region.
+3. The vacated original region becomes one continuous free block.
+
+Compaction runs in three modes:
+
+- **Synchronous** (from `__alloc_pages_direct_compact` in the allocator): triggered when an allocation cannot be satisfied. The allocator itself blocks on compaction. Used for critical high-order allocations.
+- **Asynchronous** (also from the allocator): lighter-weight, gives up more easily, runs on the allocating task's CPU time.
+- **kcompactd**: a per-node background daemon that compacts proactively to keep a reserve of free high-order blocks available.
+
+The tracepoints `compaction_isolate_migratepages`, `compaction_migratepages`, and `compaction_finished` let you observe compaction activity in real time.
+
+### NUMA balancing
+
+On multi-socket servers (rare on phones), the kernel can migrate pages to follow the CPUs that access them. This is driven by **protection faults** — periodically, the kernel temporarily marks a sample of PTEs as "no-access" (via `pte_protnone`). The next access faults into `do_numa_page`, which records which NUMA node touched the page. If the pattern shows the page is mostly accessed from a different node, the scheduler migrates it.
+
+The `mm_numa_migrate_ratelimit` tracepoint counts NUMA migrations throttled by rate limits. On NUMA servers, excessive NUMA migrations can actually hurt performance — migration has a cost, and oscillating pages get worse performance than just accepting the original placement.
+
+### Memory hotplug
+
+On cloud servers and large systems, physical memory can be added or removed at runtime. Removing memory requires migrating all pages out of the affected region. This path calls `migrate_pages` with `reason=MR_MEMORY_HOTPLUG`. Rare on phones; present in the kernel for completeness.
+
+### The migrate_pages top-level loop
+
+`migrate_pages` at `mm/migrate.c:2072` is the outer loop that takes a list of folios and migrates each one. Internally it calls `migrate_pages_batch` at `mm/migrate.c:1783`, which:
+
+1. Unlocks folios from their LRUs.
+2. For each folio, allocates a target folio.
+3. Copies data (via `migrate_folio_move`).
+4. Retries failed migrations with exponential backoff.
+5. Returns the number of pages that could not be migrated (so the caller can decide whether to fail or try again).
+
+The batch design exists because the per-folio work has fixed overhead (lock acquisition, LRU isolation, rmap walk); doing many folios at once amortizes that.
 
 ---
 
@@ -4294,6 +4465,54 @@ eBPF (v3.18, 2014) was a massive expansion: 10 64-bit registers, a 512-byte stac
 
 The verifier has grown from ~1,000 lines in v3.18 to over 20,000 lines today. Each version adds support for new patterns: bounded loops (v5.3), BPF-to-BPF function calls (v4.16), spinlocks (v5.1), ring buffers (v5.8), and BTF-based type checking that enables CO-RE portability.
 
+### The LRU: from 2Q to MGLRU
+
+Early Linux used a single LRU list — simple but coarse. The kernel couldn't distinguish hot pages that got evicted by a scan from genuinely cold pages.
+
+**Two-list (2Q) LRU** (kernel 2.4 era) introduced active and inactive lists. A page is put on the inactive list when first accessed; a second access promotes it to active. The reclaim scanner targets the inactive list, keeping hot pages safe on the active list. This is still the default on most desktop/server kernels and lives in `mm/vmscan.c`.
+
+**MGLRU (Multi-Generation LRU)**, merged in kernel 6.1, generalizes this to multiple generations per memcg. Instead of two buckets (active/inactive), there are N (typically 4), and pages age through them based on access patterns tracked via periodic page table scanning. This gives finer-grained reclaim ordering and works better on memory-pressured workloads. MGLRU is the default on Android 14+ and on many server distributions now.
+
+### The page allocator: watermarks and zones
+
+The buddy allocator divides physical memory into **zones** (ZONE_DMA, ZONE_NORMAL, ZONE_MOVABLE, ZONE_DEVICE) based on physical constraints. Each zone has **watermarks**:
+
+- `min`: emergency reserve. Only `PF_MEMALLOC` tasks (reclaim itself) can dip below.
+- `low`: wake kswapd to begin background reclaim.
+- `high`: kswapd stops when all zones are above this.
+
+`watermark_scale_factor` (a sysctl) adjusts the spread between `low` and `high`. Higher values mean kswapd works harder and earlier, at the cost of more CPU time. Android tunes this aggressively — a low-RAM phone wants kswapd to start reclaiming before memory pressure becomes severe.
+
+The transition from single-zone (2.4) to multi-zone with per-zone LRUs and per-zone reclaim watermarks happened gradually across the 2.6 series to support NUMA, larger memory, and memory hotplug.
+
+### SLAB / SLUB / SLOB / SLUB (singular)
+
+The kernel's small-object allocator has evolved dramatically:
+
+- **SLAB** (original, 1996): object caches with hard-coded slab sizes. Complex but well-optimized.
+- **SLUB** (2008): simpler, uses per-CPU freelists and per-node partial slab lists. Default since kernel 2.6.23.
+- **SLOB** (2005): simple first-fit allocator for memory-constrained embedded systems.
+
+As of kernel 6.4, SLAB was removed entirely. SLUB is now the universal small-object allocator. Every `kmalloc`, every `kmem_cache_alloc` goes through SLUB. It sits on top of the buddy allocator — SLUB requests whole pages from buddy, then carves them into small objects.
+
+This matters for the tracer because slab allocations *also* go through `mm_page_alloc` — but with `GFP_KERNEL` or other non-user flags, which our tracer's filter rejects. Understanding the allocator hierarchy is what lets you write filters that select the right traffic.
+
+### Writeback: from bdflush to per-BDI workers
+
+Writeback in early Linux used a single kernel thread (`bdflush`, then `pdflush`). Every dirty page in the system was flushed by one thread, creating scalability bottlenecks on multi-disk systems.
+
+Kernel 2.6.32 introduced per-BDI (per-backing-device) writeback threads. Each block device gets its own `kworker/u:flush-*` thread. A slow USB drive no longer stalls writeback to a fast SSD.
+
+Kernel 4.2 added **per-cgroup writeback**: dirty-page accounting and throttling happen per memcg, so one container's heavy write workload doesn't throttle another container's normal-paced dirtying.
+
+### The reverse-mapping saga
+
+File-backed reverse mapping (i_mmap) existed from the earliest days — it's needed for `munmap` to clear PTEs. But anonymous reverse mapping (anon_vma) was added much later, around kernel 2.6.
+
+Before anon_vma, anonymous pages couldn't be reclaimed — there was no way to find all PTEs pointing to an anonymous page, so the kernel couldn't safely unmap it. This meant all anonymous memory was essentially mlocked. Adding anon_vma enabled swap to work for anonymous pages.
+
+The anon_vma data structures have since gone through several redesigns to handle fork scalability (the "anon_vma scalability" patches, ~2010) — early implementations had O(N) behavior on deep fork chains.
+
 ### Why the mm subsystem looks the way it does
 
 The mm subsystem's complexity comes from a fundamental tension: **memory is a shared resource with many concurrent users, and every decision involves tradeoffs between throughput, latency, fairness, and power consumption.**
@@ -4303,6 +4522,37 @@ Lazy allocation (demand paging) trades page fault latency for memory efficiency 
 Every one of these tradeoffs is tunable, and Android tunes them differently from a server or a desktop. The kernel parameters (`dirty_ratio`, `swappiness`, `compact_proactiveness`, `watermark_scale_factor`) and the scheduling of background daemons (`kswapd`, `kcompactd`, `kworker/flush`) determine how these tradeoffs play out on a specific device.
 
 Understanding the mm subsystem is fundamentally about understanding these tradeoffs — not just what the code does, but why it does it that way, and what would break if you changed it.
+
+### Further reading
+
+If you want to dive deeper into any part of what we've covered, these are the canonical references:
+
+**Books:**
+- *Linux Kernel Development* by Robert Love — readable introduction, slightly dated but the fundamentals don't change.
+- *Understanding the Linux Virtual Memory Manager* by Mel Gorman — the definitive reference on 2.6-era mm internals. Still accurate on the core concepts (buddy, zones, LRU).
+- *Linux Kernel Networking* by Rami Rosen — for the BPF origin story and the ring buffer design.
+
+**Kernel documentation:**
+- `Documentation/admin-guide/mm/` — operator-facing docs on HugeTLB, THP, zswap, numa_balancing.
+- `Documentation/core-api/xarray.rst` — the data structure at the heart of the page cache.
+- `Documentation/filesystems/writeback.rst` — the dirty page and writeback accounting rules.
+- `Documentation/bpf/` — the BPF subsystem's user and developer guides.
+
+**LWN articles (search lwn.net):**
+- "The folio" series (Matthew Wilcox, 2021–2023) — the folio transition explained by the person doing it.
+- "The maple tree" (Jonathan Corbet, 2021) — the VMA data structure change.
+- "Multi-generational LRU" (2022) — MGLRU design and merger into mainline.
+- "Transparent huge pages: the race to fix them" — the long saga of THP.
+
+**Direct source paths worth reading end-to-end:**
+- `mm/memory.c` — the page fault handler, COW, swap-in.
+- `mm/filemap.c` — the page cache and file-backed I/O.
+- `mm/vmscan.c` — reclaim.
+- `mm/page-writeback.c` — dirty page accounting and writeback.
+- `kernel/bpf/verifier.c` (just the intro comment) — the verifier's philosophy.
+- `kernel/bpf/core.c` (`___bpf_prog_run`) — the BPF interpreter.
+
+The kernel source is the primary source of truth. Every book and article drifts; the code doesn't.
 
 ---
 
