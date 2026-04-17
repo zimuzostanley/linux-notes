@@ -1238,11 +1238,49 @@ Here, `used - buff/cache ≈ actual allocation` (7GB), and `available ≈ 4GB` i
 
 ## Part 7: The Page Fault — Where Everything Starts {#part-7-the-page-fault-where-everything-starts}
 
-When your program accesses a virtual address that has no page table entry, or has one with insufficient permissions, the CPU raises a page fault. This is not an error — it is the normal mechanism by which the kernel populates memory on demand. Most pages in a process are set up lazily: `mmap()` creates the VMA (the description of the mapping) but does not allocate any physical pages or page table entries. The first access triggers a fault, and the fault handler does the actual work.
+### 7.1 Why faults are normal
 
-### The entry point
+The word "fault" sounds like an error. It is not. Page faults are the primary mechanism by which memory gets populated. Almost nothing is set up eagerly:
 
-The architecture-specific fault handler (e.g., `arch/arm64/mm/fault.c`) catches the CPU exception, determines the faulting address, looks up the VMA, and calls:
+- `mmap()` creates a VMA but installs zero PTEs.
+- `fork()` copies PTEs but marks them read-only (COW setup).
+- `malloc()` returns an address backed by nothing (not even a PTE).
+
+The first time you touch the memory, the MMU says "I can't translate this" and raises an exception. The kernel handles it — allocates a page, reads from disk, copies on write — installs a PTE, and returns. Your program retries the instruction and succeeds. It never knows a fault happened.
+
+On a typical Android app launch, 10,000–50,000 page faults fire in the first few milliseconds. This is completely normal — the kernel being lazy in a good way, only doing work when actually needed. The benefit: memory is never allocated unless it is actually accessed, and the cost of that laziness (one fault per first access) is amortized over the lifetime of the page.
+
+### 7.2 The architecture-level entry point
+
+When the CPU raises a page fault, the architecture-specific handler (e.g., `arch/arm64/mm/fault.c`) runs first. Before calling into generic mm code, it does critical triage:
+
+```c
+// Simplified from arch/arm64/mm/fault.c:
+// 1. Read the faulting address from hardware register (FAR_EL1 on ARM64)
+unsigned long addr = read_faulting_address();
+
+// 2. Find the VMA
+struct vm_area_struct *vma = find_vma(mm, addr);
+
+// 3. Is this address within any VMA?
+if (!vma || addr < vma->vm_start)
+    // No VMA covers this address → genuine SIGSEGV
+    return handle_bad_area(addr);
+
+// 4. Check permissions against VMA flags
+if (is_write && !(vma->vm_flags & VM_WRITE))
+    // Writing to non-writable region → SIGSEGV
+    return handle_bad_area(addr);
+
+// 5. VMA found, permissions OK → handle the fault
+handle_mm_fault(vma, addr, flags, regs);
+```
+
+This is the first place the VMA matters. The page table alone can't distinguish "memory that hasn't been allocated yet" (legitimate fault, PTE is just empty) from "memory that was never mapped" (access violation, no VMA covers it). The VMA makes that distinction. Without the VMA lookup, the kernel would have no way to tell a `malloc`'d but untouched page from a wild pointer dereference.
+
+### 7.3 The generic entry point
+
+The architecture code calls `handle_mm_fault` at `mm/memory.c:6589`:
 
 ```c
 // mm/memory.c:6589
@@ -1259,9 +1297,9 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 }
 ```
 
-### Walking the page tables
+### 7.4 Walking the page tables
 
-`__handle_mm_fault` at `mm/memory.c:6355` walks the page table, allocating intermediate levels as needed:
+`__handle_mm_fault` at `mm/memory.c:6355` walks down the page table, allocating intermediate levels as needed:
 
 ```c
 static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
@@ -1285,11 +1323,19 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 }
 ```
 
-At each level, if the entry is empty (`pud_none`, `pmd_none`), the kernel allocates a new page for the next level of the table. These page table pages are themselves allocated from the buddy allocator with `GFP_KERNEL` — they are non-movable kernel memory. This is why the kernel keeps page tables small: a process that maps enormous address spaces but touches little memory still pays for the intermediate page table levels.
+**The `pgoff` field is important for file-backed VMAs.** It computes which page of the file corresponds to this virtual address:
+
+```
+pgoff = vma->vm_pgoff + (address - vma->vm_start) / PAGE_SIZE
+```
+
+If the VMA maps a file starting at offset 0 and the faulting address is 8192 bytes into the VMA, then `pgoff = 2` — we need page 2 of the file. This pgoff will be used to look up the page in the page cache via `filemap_get_folio(mapping, pgoff)`.
+
+The `p4d_alloc`, `pud_alloc`, `pmd_alloc` functions allocate physical pages for intermediate page table levels if the current entry is NULL. These are non-movable kernel pages from the buddy allocator (`GFP_KERNEL`). This is demand-driven — page table levels are only created when a fault walks through them. A process that maps 1TB of address space but only touches 4KB will have exactly the page table entries needed for that one page.
 
 Also notice the huge page checks — at the PUD level (1GB pages) and PMD level (2MB pages on x86, or variable on ARM64), the kernel can take a shortcut and map a single large page instead of walking down to individual PTEs. Android uses Transparent Huge Pages (THP) for some workloads, which can reduce TLB pressure significantly.
 
-### The PTE-level dispatcher
+### 7.5 The five-way dispatch
 
 `handle_pte_fault` at `mm/memory.c:6273` is the critical decision point. It reads the PTE and decides what to do:
 
@@ -1342,7 +1388,7 @@ This is a five-way dispatch:
 4. **Write-protect** (`do_wp_page`): A write to a read-only PTE. Could be COW (after fork) or a shared mapping becoming writable.
 5. **Normal access**: PTE exists and has sufficient permissions. Just update the accessed/dirty bits and return.
 
-### File-backed fault: do_fault and its three sub-paths
+### 7.6 File-backed fault: do_fault and its three sub-paths
 
 `do_fault` at `mm/memory.c:5903` splits into three paths depending on the type of access:
 
