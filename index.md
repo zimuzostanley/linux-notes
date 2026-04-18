@@ -2922,6 +2922,48 @@ set_pte_range(vmf, folio, page, nr_pages, addr); // commit
 
 This pattern minimizes the time locks are held, which is critical for scalability — you do not want to hold a spinlock while waiting for disk I/O.
 
+### LRU lock
+
+The lock hierarchy listed above includes the LRU lock but it deserves its own explanation. The LRU lock (`lruvec->lru_lock`) is a per-lruvec spinlock that protects the LRU lists — the lists that reclaim scans to find pages to evict.
+
+Every `folio_add_lru` (adding a page to the LRU after allocation) and every `folio_del_from_lru_list` (removing a page during reclaim) acquires this lock. Under heavy allocation or reclaim pressure, the LRU lock becomes contended.
+
+The lock is per-lruvec, not global. On non-NUMA systems, there is one lruvec per memory cgroup (if memcg is enabled) or one global lruvec. On NUMA, there is one per node per memcg. This keeps contention proportional to the number of CPUs sharing a NUMA node, not the total CPU count.
+
+Operations that hold the LRU lock are short — a `list_add` or `list_del`, plus a few counter updates. The lock is always acquired with IRQs disabled (`spin_lock_irq`) because LRU operations can happen from both process context and softirq context (reclaim runs from both).
+
+### lockdep: how the kernel catches deadlocks before they happen
+
+lockdep is a runtime lock validator compiled into debug kernels (`CONFIG_LOCKDEP=y`). It does not detect deadlocks after they happen — it detects lock ordering violations that *could* cause deadlocks, even if the actual deadlock never occurs during that boot.
+
+lockdep assigns each lock a **class** based on where it was initialized in the source code. Every time any code path acquires a lock, lockdep records the class of every lock already held by that CPU. This builds a directed graph of "class A was held while acquiring class B."
+
+If lockdep ever sees the reverse — "class B was held while acquiring class A" — it reports an inversion. Two code paths acquiring the same two locks in different orders will eventually deadlock if they run concurrently, even if they haven't yet.
+
+Concrete example from mm:
+
+```
+CPU 0 (page fault path):
+  1. Acquire mmap_lock (read)
+  2. Acquire folio lock
+
+  lockdep records: mmap_lock → folio_lock   (order A → B)
+
+CPU 1 (truncate path, hypothetical bug):
+  1. Acquire folio lock
+  2. Acquire mmap_lock (write)
+
+  lockdep records: folio_lock → mmap_lock   (order B → A)
+
+  LOCKDEP WARNING: possible circular locking dependency detected
+```
+
+CPU 0 and CPU 1 have never actually deadlocked — they may have run hours apart. But lockdep sees that the graph now has a cycle (A → B and B → A) and reports it immediately. The warning includes full stack traces for both acquisition sites so you can find the bug.
+
+lockdep also tracks **IRQ state**: whether a lock has been acquired with IRQs enabled or disabled. If a lock is ever acquired with IRQs enabled AND the same lock class is acquired inside an IRQ handler, that's a potential deadlock — the IRQ can fire while the non-IRQ path holds the lock, and the IRQ handler spins forever waiting for a lock held by code that can't run (because the IRQ preempted it).
+
+The mm subsystem's xarray lock uses `xa_lock_irqsave` precisely because the xarray can be modified from both process context (page cache insertion during fault) and interrupt context (bio completion calling `folio_end_writeback` which may modify xarray tags). lockdep would catch it if someone used `xa_lock` without disabling IRQs.
+
 ### Lock ordering rule
 
 Sleeping locks must be acquired before spinlocks. Never the reverse.
@@ -3751,6 +3793,10 @@ Two caveats:
 - **`sizeof(struct page)` in BPF.** The verifier's BTF support lets you use `bpf_core_type_size(struct page)`, which gets resolved at load time from the kernel's BTF. Hardcoding 64 (the common size on 64-bit) is risky — the struct is occasionally 56 or 72 depending on config.
 - **KASLR.** If the kernel is built with KASLR, `vmemmap_base` shifts on each boot. Userspace must read the current value from kallsyms; compile-time constants will not work.
 
+**`sizeof(struct page)` at runtime.** Hardcoding `sizeof(struct page) = 64` is common but wrong on some configs. Use BTF: `bpf_core_type_size(struct page)` is resolved at load time by libbpf reading the kernel's BTF. It produces a constant in the compiled BPF code — no runtime cost. If unavailable, fall back to 64 as the common case on 64-bit systems.
+
+**Android GKI specifics.** As of Android 14 (kernel 5.15) and Android 15 (kernel 6.1), `bpf_page_to_pfn` is not exported as a kfunc. The vmemmap math approach is the only option. On ARM64 with 48-bit VA and 4KB pages (the standard GKI configuration), `VMEMMAP_START` is a compile-time constant that shifts with KASLR. Userspace must read the runtime value from `/proc/kallsyms` (requires root on Android, which the tracer already needs for `bpf()` syscalls).
+
 The cleanest alternative, when your kernel supports it, is to use the `bpf_page_to_pfn` kfunc (added in newer kernels). A kfunc is a kernel function explicitly exported for BPF, with verifier type checking. If available, it is both safer and simpler:
 
 ```c
@@ -3944,7 +3990,89 @@ int on_dirty(struct pt_regs *ctx) {
 }
 ```
 
-Every other handler follows the same pattern: get PFN from tracepoint/kprobe args → look up page_id → emit event. The pattern is always three lines of boilerplate plus the event-specific fields.
+### Handler: page fault (covers both file-backed and anonymous)
+
+Rather than hooking `do_anonymous_page` and `filemap_fault` separately, hook `finish_fault` — it is called for all successful fault paths (`do_read_fault`, `do_cow_fault`, `do_shared_fault`, and `do_anonymous_page` all converge on it). The `vm_file` check distinguishes file faults from anonymous faults:
+
+```c
+SEC("kprobe/finish_fault")
+int on_fault(struct pt_regs *ctx) {
+    struct vm_fault *vmf = (struct vm_fault *)PT_REGS_PARM1(ctx);
+
+    struct page *page = BPF_CORE_READ(vmf, page);
+    if (!page) return 0;
+
+    unsigned long pfn = folio_to_pfn_helper(page_folio(page));
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+
+    unsigned long address = BPF_CORE_READ(vmf, address);
+    unsigned int flags = BPF_CORE_READ(vmf, flags);
+    struct vm_area_struct *vma = BPF_CORE_READ(vmf, vma);
+    struct file *vm_file = BPF_CORE_READ(vma, vm_file);
+
+    u32 evt_type = vm_file ? EVT_FAULT : EVT_ANON_FAULT;
+
+    struct page_event *e = emit(page_id, pfn, evt_type, 0);
+    if (!e) return 0;
+
+    e->fault.address = address;
+    e->fault.is_write = !!(flags & FAULT_FLAG_WRITE);
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+```
+
+Caveat: `finish_fault` is called with the PTE lock held (it is about to install the PTE). The kprobe runs inside the lock. This is safe — kprobes and eBPF run in the same context as the hooked function — but it means the eBPF program adds latency to the PTE-locked critical section. Keep the handler fast.
+
+### Handler: copy-on-write
+
+When `wp_page_copy` fires, the kernel is copying a shared page for one process. The tracer needs to link the new page (being allocated for the writer) to the old page (being copied from). The approach: hook `wp_page_copy` entry to record the old page_id in a per-tgid scratch map, then check that map in `on_page_alloc` to emit `EVT_COW` instead of `EVT_ALLOC`:
+
+```c
+SEC("kprobe/wp_page_copy")
+int on_cow_entry(struct pt_regs *ctx) {
+    struct vm_fault *vmf = (struct vm_fault *)PT_REGS_PARM1(ctx);
+
+    struct page *old_page = BPF_CORE_READ(vmf, page);
+    if (!old_page) return 0;
+
+    unsigned long old_pfn = folio_to_pfn_helper(page_folio(old_page));
+    u64 old_page_id = get_page_id(old_pfn);
+
+    u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    struct cow_pending val = {
+        .old_page_id = old_page_id,
+        .address = BPF_CORE_READ(vmf, address),
+    };
+    bpf_map_update_elem(&pending_cow, &tgid, &val, BPF_ANY);
+    return 0;
+}
+```
+
+Then in `on_page_alloc`, after assigning the new page_id:
+
+```c
+// Check if this allocation is a COW copy
+u32 tgid = bpf_get_current_pid_tgid() >> 32;
+struct cow_pending *cow = bpf_map_lookup_elem(&pending_cow, &tgid);
+if (cow) {
+    struct page_event *e = emit(page_id, pfn, EVT_COW, ctx->order);
+    if (e) {
+        e->cow.old_page_id = cow->old_page_id;
+        e->cow.address = cow->address;
+        bpf_ringbuf_submit(e, 0);
+    }
+    bpf_map_delete_elem(&pending_cow, &tgid);
+    return 0;  // skip normal EVT_ALLOC
+}
+```
+
+This gives a single `EVT_COW` event with both the new `page_id` (assigned by `on_page_alloc`) and the `old_page_id` (from `pending_cow`). Pure ID-based linking, no timestamp correlation.
+
+### Handler: every other event
+
+Every remaining handler follows the same pattern: get PFN from tracepoint/kprobe args → look up page_id → emit event. The pattern is always three lines of boilerplate plus the event-specific fields.
 
 ### Tracing the I/O path: from page to sector and back
 
@@ -4180,6 +4308,88 @@ An alternative worth mentioning: some kernels expose `trace_block_bio_queue` whi
 ### A note on plugging
 
 The block layer's plug mechanism means bios submitted within a `blk_start_plug`/`blk_finish_plug` section are deferred. Your `on_bio_add_folio` fires early; your `on_rq_issue` fires later when the plug is flushed. This is fine — the sector map keeps the mapping alive across the gap. But if you are computing "time from dirty to dispatch," the gap between `EVT_WRITEBACK` and `EVT_IO_ISSUE` includes this plug time, which can be several milliseconds on a busy system.
+
+### Large folio handling
+
+When the kernel allocates a large folio (order > 0), the tracer assigns one `page_id` for the entire folio. A single order-4 folio (16 contiguous pages, 64KB) gets one page_id, one `pfn_to_id` entry for the head page's PFN, and one EVT_ALLOC event with `order=4`.
+
+Tracepoints and kprobes consistently report the head page's PFN for large folios — `mm_page_alloc`, `mm_filemap_add_to_page_cache`, and all the kprobe targets receive the folio pointer (which IS the head page). The `get_page_id(pfn)` lookup works because the `pfn_to_id` map contains the head PFN.
+
+The complication is `bio_add_folio` for large folios: the bio may cover the full 64KB, meaning the `sector_to_id` map needs an entry for every 4KB-aligned sector in the range. The `on_bio_add_folio` handler populates `sector_to_id` for every 4KB chunk:
+
+```c
+// Inside on_bio_add_folio, for large folios:
+u32 nr_pages = len / 4096;
+if (nr_pages == 0) nr_pages = 1;
+if (nr_pages > 16) nr_pages = 16;  // bound for verifier
+
+#pragma unroll
+for (u32 i = 0; i < 16; i++) {
+    if (i >= nr_pages) break;
+    struct sector_key key = { .dev = dev, .sector = sector + i * 8 };
+    bpf_map_update_elem(&sector_to_id, &key, &page_id, BPF_ANY);
+}
+```
+
+Every event carries `order`. Userspace knows that a page_id with `order=4` represents 64KB. Latency calculations are per-folio, not per-4KB-page. The kernel treats the folio as a unit for I/O, reclaim, and dirty tracking.
+
+### Swap-in / swap-out correlation
+
+When an anonymous page is swapped out to zRAM and later swapped back in, the old page_id (pre-swap) and new page_id (post-swap) have no link. The PFN changed. The page_id was assigned fresh at allocation.
+
+The link is the **swap entry** — a `(type, offset)` pair stored in the PTE after the page is swapped out. To correlate, the tracer maintains a `swap_to_id` map:
+
+```c
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);  // LRU to avoid filling up
+    __uint(max_entries, 65536);
+    __type(key, u64);       // swap entry value
+    __type(value, u64);     // old page_id
+} swap_to_id SEC(".maps");
+```
+
+At swap-out time (inside a `swap_writepage` kprobe), before the page is freed, read `folio->swap` and store `swap_entry → old_page_id`. At swap-in time (`do_swap_page` kprobe), read the swap entry from the non-present PTE, look up `swap_to_id`, and emit an `EVT_SWAP_IN` linking old and new page_ids.
+
+This is the single most fragile part of the tracer. The swap entry encoding is architecture-specific (different bit layouts on ARM64 vs x86-64). The `swap_to_id` map has finite size and can fill on long traces with heavy swap. If swap correlation is not needed, omit it — the rest of the tracer works without it. Swap-out shows as a normal lifecycle (`alloc → fault → zram_compress → free`). Swap-in shows as a fresh lifecycle (`alloc → fault`). They just aren't linked.
+
+### File filter resolution
+
+The user specifies `--file "/usr/lib/*.so"`. Userspace resolves this to `(ino, dev)` pairs using `glob()` + `stat()` and populates the `tracked_inodes` BPF map before attaching programs:
+
+```c
+static int resolve_file_filter(const char *pattern, int map_fd) {
+    glob_t g = {0};
+    int ret = glob(pattern, GLOB_TILDE | GLOB_BRACE, NULL, &g);
+    if (ret == GLOB_NOMATCH) {
+        fprintf(stderr, "error: no files match '%s'\n", pattern);
+        return -1;
+    }
+
+    int count = 0;
+    for (size_t i = 0; i < g.gl_pathc; i++) {
+        struct stat st;
+        if (stat(g.gl_pathv[i], &st) < 0) continue;
+        if (!S_ISREG(st.st_mode)) continue;
+
+        struct inode_key key = { .ino = st.st_ino, .dev = st.st_dev };
+        u8 val = 1;
+        bpf_map_update_elem(map_fd, &key, &val, BPF_ANY);
+        count++;
+    }
+    globfree(&g);
+    return count;
+}
+```
+
+On Android, useful patterns:
+
+```bash
+page_tracer --file "/data/app/~~*/com.example.app-*/base.apk"
+page_tracer --file "/data/dalvik-cache/arm64/*.odex"
+page_tracer --file "/apex/com.android.runtime/lib64/bionic/libc.so"
+```
+
+The glob handles the `~~*` random directory suffix Android uses for APK installation paths.
 
 ### The userspace program: a production-quality implementation
 
@@ -4832,6 +5042,38 @@ Tuning knobs:
 | `sector_to_id` max_entries | Memory for inflight I/O tracking | 8K–64K |
 | Filter specificity | Reduce event volume | Always use one in production |
 | Poll timeout | Userspace CPU vs latency | 10–100ms |
+
+### Tracer lifecycle: start, stop, and map cleanup
+
+When the tracer stops (trace session ends, SIGINT received), pages that were allocated and tracked but not yet freed have entries in `pfn_to_id`. On the next trace session, these stale entries cause problems: a PFN reused for a different page gets the old page_id, corrupting the event stream.
+
+The fix: clean shutdown.
+
+```c
+static void cleanup(struct page_tracer_bpf *skel) {
+    // 1. Detach all programs — stop capturing events
+    page_tracer_bpf__detach(skel);
+
+    // 2. Drain the ring buffer — process remaining events
+    ring_buffer__poll(rb, 0);
+
+    // 3. Clear all maps — stale entries corrupt next session
+    clear_map(bpf_map__fd(skel->maps.pfn_to_id));
+    clear_map(bpf_map__fd(skel->maps.sector_to_id));
+
+    // 4. Reset page_id counter
+    u32 zero = 0; u64 zero_val = 0;
+    bpf_map_update_elem(bpf_map__fd(skel->maps.page_id_counter),
+                        &zero, &zero_val, BPF_ANY);
+
+    // 5. Destroy skeleton (frees programs and maps)
+    page_tracer_bpf__destroy(skel);
+}
+```
+
+Each trace session starts with a clean `open_and_load` → `configure_maps` → `attach` sequence. No cross-session state corruption.
+
+When using the Perfetto C SDK, the cleanup is triggered by the data source `on_stop` callback, and `on_start` loads fresh state. Each Perfetto trace session gets its own BPF skeleton lifecycle.
 
 ### Known limitations
 
