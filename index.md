@@ -511,9 +511,12 @@ Bit 0:       Valid — is this entry present?
 Bits 47–12:  Physical PFN (36 bits → 256TB addressable)
 Bit 10:      Access Flag (AF) — hardware sets on any access
 Bits 8–7:    Access Permission (AP) — read/write, kernel/user
+Bit 51:      Dirty Bit Modifier (DBM) — hardware sets on write (ARMv8.1+)
 Bit 54:      Execute Never (XN) — blocks code execution
 Bits 58–55:  Software bits — kernel's private flags, hardware ignores
 ```
+
+On older ARM64 without DBM (ARMv8.0), the kernel emulates dirty tracking: writable pages start with AP set to read-only, and the first write triggers a permission fault. The fault handler sets the dirty bit in software and makes the PTE writable. This costs one fault per first-write per page but is transparent to userspace.
 
 **When bit 0 is 0 (invalid):** the MMU ignores the entry. The kernel repurposes the other 63 bits to encode swap locations, migration state, or NUMA hints. One set of bits serves completely different purposes depending on whether hardware or software is reading them. This bit-repurposing is how swap entries and migration entries fit in the same PTE slot — you saw a consequence of this in `handle_pte_fault` (Part 7 later): `if (!pte_present(vmf->orig_pte)) return do_swap_page(vmf);`. The PTE is "not present" but its bits encode where to find the page in swap.
 
@@ -622,7 +625,18 @@ struct mm_struct {
 };
 ```
 
-The `mm_mt` field is a **maple tree** — a B-tree variant optimized for ranges. It replaced the old red-black tree (`mm_rb`) and linked list (`mmap`) in v6.1. The maple tree is more cache-friendly because it packs multiple entries into each node, reducing the number of pointer chases during VMA lookup. On a process with hundreds of VMAs (common on Android — shared libraries, mmap'd files, anonymous regions), this matters.
+The `mm_mt` field is a **maple tree** — a B-tree variant optimized for ranges. It replaced the old red-black tree (`mm_rb`) and linked list (`mmap`) in v6.1. The maple tree is more cache-friendly because it packs multiple entries into each node (up to 16 VMA pointers per node), reducing the number of pointer chases during VMA lookup. On a process with hundreds of VMAs (common on Android — shared libraries, mmap'd files, anonymous regions), this matters.
+
+Unlike the old rbtree, where each VMA had an embedded `rb_node` field used as the tree node, the maple tree manages its own internal nodes. VMAs do not contain any maple-tree-specific field — the tree stores pointers to VMAs, and the VMA struct is cleaner for it.
+
+`mm_mt` and `pgd` are two parallel roots describing the same address space:
+
+```
+mm_mt → maple tree → VMAs     "what SHOULD exist" (intent, permissions, backing)
+mm->pgd → page table → PTEs   "what DOES exist"   (actual physical mappings)
+```
+
+A VMA can exist with no PTEs (just `mmap`'d, never touched). A PTE cannot exist without a VMA — the fault handler checks `find_vma(mm, address)` first, and if no VMA covers the faulting address, the result is SIGSEGV. Every page fault starts at `mm_mt` to find the VMA, then walks `mm->pgd` to find or create the PTE.
 
 ### 4.2 vm_area_struct (VMA)
 
@@ -636,12 +650,18 @@ struct vm_area_struct {
     struct mm_struct *vm_mm;             // line 929 — back pointer to the mm
     pgprot_t vm_page_prot;               // line 930 — hardware protection bits
     vm_flags_t vm_flags;                 // line 939 — VM_READ, VM_WRITE, VM_SHARED...
+    struct {
+        struct rb_node rb;               // node in address_space->i_mmap
+        unsigned long rb_subtree_last;   // interval tree support
+    } shared;                            // linkage into file's reverse mapping tree
     struct anon_vma *anon_vma;           // line 968 — reverse mapping for anon pages
     const struct vm_operations_struct *vm_ops; // line 971 — fault handler, etc.
     unsigned long vm_pgoff;              // line 974 — file offset in pages
     struct file *vm_file;                // line 976 — the backing file, or NULL
 };
 ```
+
+The `shared.rb` field links this VMA into the file's `address_space->i_mmap` interval tree (see section 4.11). When you `mmap` a file, the kernel inserts your VMA's `shared.rb` into the file's `i_mmap` tree. When you `munmap`, it removes it. This is how `try_to_unmap` finds all processes mapping a given file page.
 
 **The vm_file discriminator:**
 
@@ -821,7 +841,21 @@ _refcount: total references from all sources
   When this hits 0: page is freed to the buddy allocator
 ```
 
-They answer different questions. A page in the page cache but not mapped by any process has `_mapcount = -1, _refcount = 1` — reclaim can free it without calling `try_to_unmap`, but must first remove it from the xarray (which drops the refcount to 0, triggering the free).
+They answer different questions. Concrete examples of how they diverge:
+
+```
+Scenario                              _mapcount    _refcount
+──────────────────────────────────────────────────────────────
+Just allocated, not yet used              -1           1
+In page cache, not mapped by anyone       -1           1   (xarray holds ref)
+In page cache, mapped by 1 process         0           2   (xarray + 1 PTE)
+In page cache, mapped by 3 processes       2           4   (xarray + 3 PTEs)
+Mapped by 1 process, active bio in flight  0           3   (xarray + PTE + bio)
+Unmapped, DMA-pinned for GPU               -1           2   (xarray + DMA pin)
+Being freed (refcount about to hit 0)     -1           0   → buddy allocator
+```
+
+Reclaim checks `_mapcount` first: if ≥ 0, it must call `try_to_unmap` to clear all PTEs before the page can be freed. If -1, no PTEs exist and reclaim skips straight to removing the page from the page cache (which drops the xarray's refcount, bringing `_refcount` to 0, which triggers the actual free).
 
 The offset encoding of `_mapcount` (−1 for zero PTEs) is a trick so that `atomic_add_negative(-1, &page->_mapcount)` returns true exactly when the page becomes unmapped. This lets `folio_remove_rmap_pte` atomically decrement and check "was this the last PTE?" in one instruction.
 
@@ -908,18 +942,20 @@ Every file that has been read or mmap'd has an `address_space` struct that acts 
 ```c
 // include/linux/fs.h:470
 struct address_space {
-    struct inode        *host;            // the inode (file) this cache belongs to
-    struct xarray       i_pages;          // the actual cache: file offset → folio
+    struct inode        *host;            // back pointer: page → file (Question 2)
+    struct xarray       i_pages;          // page cache: file offset → folio (Question 1)
     gfp_t               gfp_mask;         // allocation flags for new pages
     atomic_t            i_mmap_writable;  // how many writable shared mmaps
-    struct rb_root_cached i_mmap;         // all VMAs that map this file
+    struct rb_root_cached i_mmap;         // reverse map: all VMAs mapping this file (Question 3)
     unsigned long       nrpages;          // pages currently in cache
     pgoff_t             writeback_index;  // where writeback left off
-    const struct address_space_operations *a_ops; // readpage, writepage, etc.
+    const struct address_space_operations *a_ops; // filesystem callbacks (readahead, writepages)
     unsigned long       flags;            // AS_* flags
     errseq_t            wb_err;           // most recent writeback error
 };
 ```
+
+Both `i_pages` and `i_mmap` live on the same struct. One file, one `address_space`, one page cache index, one reverse mapping tree. The `address_space` is embedded directly inside `struct inode` as the `i_data` field — not a separate allocation.
 
 The `i_pages` xarray is the heart of the page cache. It is indexed by page offset within the file — given a file offset, you can find the corresponding cached page in O(log n) time. The xarray also supports **marks** (tags) on entries, which the kernel uses to efficiently find dirty or writeback pages without scanning the entire cache:
 
@@ -969,21 +1005,35 @@ Query: which VMAs contain page 130?
   All three.
 ```
 
-For each matching VMA, compute the virtual address:
+For each matching VMA, the kernel computes the virtual address of page 130 in that process:
 
 ```
 virtual_addr = vm_start + (page_index - vm_pgoff) × PAGE_SIZE
 ```
 
-Then walk that process's page table to find and clear the PTE.
+Process A: `0x7f000000 + (130 - 0) × 4096 = 0x7f082000`
+Process B: `0x40000000 + (130 - 0) × 4096 = 0x40082000`
+Process C: `0x80000000 + (130 - 128) × 4096 = 0x80002000`
 
-**Why not a hash table.** Hash tables do exact match. The question is "which VMAs overlap page 130?" — a range query. VMA (pgoff 0–255) contains page 130, but hashing 130 would never find it. An interval rbtree is the right data structure because it supports efficient range containment queries.
+Then for each process, walk that process's page table (`vma->vm_mm->pgd`) to find the PTE at the computed virtual address and clear it. Three VMAs checked, three PTEs cleared — not millions.
+
+The question is a **range containment query**: "which VMAs contain page 130?" A VMA mapping pages 0–255 contains page 130, but you would never find it by hashing the number 130 or doing an exact-match lookup. A hash table finds exact keys; a linked list requires scanning every entry. An interval rbtree answers range containment in O(log n + k) where k is the number of matches — the tree can skip entire subtrees whose intervals do not contain the target.
 
 **Why this matters for reclaim.** Before the kernel can free a file-backed page, it must clear every PTE that points to it. Without `i_mmap`, finding those PTEs would require scanning every process's page tables — impractical. With `i_mmap`, the kernel walks a small set of VMAs and for each one clears exactly one PTE. This is what `try_to_unmap` does in the reclaim path (Part 11).
 
 ### 4.12 Anonymous Reverse Mapping (anon_vma)
 
 Anonymous pages have no file, no `address_space`, no `i_mmap`. Instead, the `mapping` field (with bit 0 set) points to an `anon_vma` — a structure linking all VMAs that might share this anonymous page.
+
+**Why this structure is needed.** Without reverse mapping for anonymous pages, the kernel cannot reclaim them — it has no way to find and clear all PTEs pointing to an anonymous page, so it cannot safely free it. Before anon_vma was added (around kernel 2.6), anonymous pages were essentially mlocked. Adding anon_vma enabled swap for anonymous pages.
+
+**Why not store PTE pointers directly on the page.** Two problems:
+
+1. **Multiple mappings.** After fork, two processes have PTEs pointing to the same page. You would need a variable-length list of PTE pointers stored on each 64-byte `struct page`. There is no room — adding 16 bytes per potential mapping to `struct page` would cost hundreds of megabytes across 2 million pages.
+
+2. **PTEs move.** When `mremap` moves a mapping, or `mprotect` splits a VMA into pieces, PTEs may end up in different page table pages at different addresses. Every page mapped in the affected VMA would need its stored PTE pointer updated — thousands of updates per VMA operation.
+
+The `anon_vma` approach is indirect but stable. The `anon_vma` points to VMAs (few per region). Each VMA knows its `vm_start`. The virtual address is recomputed on demand from the folio's `index` field (which stores the virtual page number at birth). The PTE is found by walking the page table — never stored directly.
 
 Sharing happens via fork: parent and child both have PTEs pointing to the same physical page.
 
@@ -1245,10 +1295,19 @@ Backing store:  disk              swap/zram          swap/zram
 vm_file:        yes               yes                NULL
 Page cache:     yes               yes                no
 vm_ops->fault:  filemap_fault     shmem_fault        NULL (hardcoded path)
+PG_swapbacked:  no                yes                yes
 Survives reboot: yes              no                 no
 ```
 
-This hybrid is useful for inter-process shared memory (POSIX `shm_open`, System V `shmget`), GPU drivers' mappings, and Android's `ashmem` (anonymous shared memory). The tracer needs to know about it because shmem pages look file-backed to most of the mm code but behave like anonymous pages during reclaim.
+The `PG_swapbacked` flag is what tells reclaim to write to swap/zram instead of trying writeback to disk. File pages are not swapbacked — they go to their filesystem. Shmem pages are swapbacked — they go to swap even though they have an `address_space` and sit in the page cache.
+
+This hybrid matters on Android:
+
+- **ashmem / memfd:** Android's inter-process shared memory (used by SurfaceFlinger, Binder, and app-to-app communication) is backed by tmpfs. These pages are in the page cache with an inode, but under memory pressure they get compressed into zRAM like anonymous pages.
+- **GPU buffers:** Some GPU drivers allocate backing storage via shmem. The pages look file-backed to `mm_filemap_add_to_page_cache` tracepoints but behave like anonymous pages during reclaim.
+- **ART runtime:** The Android Runtime's boot image can be backed by memfd (a tmpfs variant), meaning the shared runtime data across all apps is shmem-backed.
+
+The tracer needs to handle this: shmem pages fire the `mm_filemap_add_to_page_cache` tracepoint (because they enter the page cache), and the `on_cache_add` handler will see a valid `i_ino` and `s_dev`. But during reclaim, these pages go through the swap path, not the writeback path. A page with `EVT_CACHE_INSERT` followed by `EVT_ZRAM_COMPRESS` (instead of `EVT_WRITEBACK`) is a shmem page.
 
 ---
 
@@ -2754,6 +2813,21 @@ The batch design exists because the per-folio work has fixed overhead (lock acqu
 
 Multiple CPUs can fault on the same page simultaneously. Reclaim can try to evict a page while a process is mapping it. Writeback can be writing a page while the process is dirtying it again. The mm subsystem uses a layered locking strategy to handle all of this.
 
+### The lock hierarchy
+
+From coarsest to finest, acquired in this order:
+
+```
+mmap_lock          (per-mm, rw semaphore)     — protects VMA tree
+  per-VMA lock     (per-VMA, rw semaphore)    — protects individual VMA (v6.4+)
+    folio lock     (per-folio, sleeping bit)   — serializes I/O on page contents
+      page table lock (per-PTE-page, spinlock) — protects PTE modifications
+        xarray lock   (per-address_space, spin) — protects page cache tree
+          LRU lock    (per-lruvec, spinlock)   — protects LRU list operations
+```
+
+Acquiring locks out of order causes deadlocks. The kernel's lockdep infrastructure detects inversions at runtime.
+
 ### mmap_lock (the big lock)
 
 `mm_struct.mmap_lock` is a reader-writer semaphore that protects the VMA tree:
@@ -2763,7 +2837,11 @@ Multiple CPUs can fault on the same page simultaneously. Reclaim can try to evic
 
 Multiple page faults can proceed concurrently (read lock is shared). But `mmap()` blocks all faults (write lock is exclusive). This is why `mmap()` inside a hot loop can be a performance problem — it serializes against all page faults in the process.
 
-Recent kernels (v6.4+) added **per-VMA locking**, which narrows the lock from per-mm to per-VMA. Page faults only need to lock the specific VMA they are faulting in, so faults in different regions proceed independently. This is a huge scalability win for processes with many threads faulting on different files.
+### Per-VMA locks (v6.4+)
+
+Recent kernels narrow the lock from per-mm to per-VMA for page faults. A fault only needs to lock the specific VMA it is faulting in. Two threads faulting on different files (different VMAs) acquire different locks and proceed independently, even while a third thread is calling `mmap()` to create a new VMA.
+
+The per-VMA lock is a separate `rw_semaphore` embedded in each `vm_area_struct`. The fault path tries the per-VMA lock first; if it succeeds, the fault proceeds without touching `mmap_lock` at all. If it fails (because `mmap()` is restructuring this specific VMA), it falls back to `mmap_lock`.
 
 ### Page table lock (ptl)
 
@@ -3353,6 +3431,40 @@ No kernel patches needed. Stock tracepoints cover the high-volume events (alloc,
 ## Part 16: Building a Page Lifecycle Tracer with eBPF {#part-16-building-a-page-lifecycle-tracer-with-ebpf}
 
 Now we put it all together. The goal: track every physical page from allocation through page cache insertion, fault, dirty, writeback, I/O, and free. Userspace reads a stream of events from the BPF ring buffer and can reconstruct any page's history at any point.
+
+### The page lifecycle
+
+A physical page moves through a sequence of states. The tracer captures each transition:
+
+```
+FILE-BACKED PAGE:
+
+  buddy allocator
+       │
+       ▼
+  ALLOC → CACHE_INSERT → FAULT → DIRTY → WRITEBACK → IO_ISSUE
+                                    │         │           │
+                                    │         │           ▼
+                                    │         │      IO_COMPLETE
+                                    │         │           │
+                                    │         ▼           ▼
+                                    │      WB_DONE ──→ (re-dirty? → DIRTY again)
+                                    │         │
+                                    ▼         ▼
+                               CACHE_REMOVE → FREE → buddy allocator
+
+ANONYMOUS PAGE:
+
+  ALLOC → ANON_FAULT (born dirty) → ZRAM_COMPRESS → FREE
+               │
+               └── COW (if forked) → new page_id
+
+MIGRATION (can happen at any lifecycle stage):
+
+  ... → MIGRATE(old_pfn → new_pfn, same page_id) → ...
+```
+
+Every box is an event the tracer emits. Every event carries the same `page_id`, so the full lifecycle reconstructs by `SELECT * FROM page_event WHERE page_id = N ORDER BY ts`.
 
 ### Why an event stream, not a per-page struct
 
@@ -4767,6 +4879,20 @@ Perfetto:
 
 The tracer registers as a Perfetto data source. When `traced` starts a trace with the `linux.page_lifecycle` data source enabled, the tracer loads and attaches the eBPF programs. When the trace stops, it detaches. This is the standard Perfetto data source lifecycle — the same pattern used by `traced_probes` for ftrace events.
 
+### Why the C SDK, not the C++ SDK
+
+Perfetto offers two APIs. The C++ `DataSource` API is designed for in-process tracing (instrumenting your own application). The C SDK (`perfetto/tracing/ctrace.h`) is for out-of-process system daemons that produce events from external sources — which is what the tracer is. The C SDK registers a data source with `traced`, receives start/stop callbacks, and writes TracePackets using the C protobuf serialization API.
+
+### TrackEvent vs custom proto
+
+Two approaches for encoding page lifecycle events in TracePackets:
+
+**TrackEvent (no Perfetto changes needed).** Use the generic TrackEvent format with custom debug annotations. The existing trace processor already knows how to parse TrackEvents and expose them as the `slice` and `instant` tables. Page events appear as events on a custom track. The downside: no type-safe SQL columns — event-specific data is in debug annotation key-value pairs that require casting and string matching.
+
+**Custom proto (requires Perfetto changes).** Define a `PageLifecycleEvent` proto message as a TracePacket extension. Write a trace processor plugin that parses these messages and creates a dedicated `page_event` SQL table with typed columns (`page_id INT`, `pfn INT`, `type TEXT`, etc.). The downside: you must modify the Perfetto source and rebuild the trace processor.
+
+For prototyping, TrackEvent works immediately. For production use on Android, the custom proto path gives better SQL ergonomics and is worth the Perfetto-side work.
+
 ### SQL-based correlation
 
 Every event carries `page_id`. Every join is on `page_id`:
@@ -4883,7 +5009,21 @@ page_tracer --file "/system/lib64/*.so"
 
 ### UFS storage
 
-Android uses UFS, not NVMe. ~100–500µs typical hardware latency. FTL garbage collection causes 5–50ms spikes — the single biggest source of tail latency on Android. The tracer captures `EVT_IO_ISSUE → EVT_IO_COMPLETE` gaps that reveal these spikes directly.
+Android uses UFS, not NVMe. Single command queue (UFS 3.x) or limited multi-queue (UFS 4.0), compared to NVMe's 65K queues. ~100–500µs typical hardware latency for 4KB random reads. FTL garbage collection causes 5–50ms spikes — the single biggest source of tail latency on Android. The tracer captures `EVT_IO_ISSUE → EVT_IO_COMPLETE` gaps that reveal these spikes directly.
+
+Thermal throttling compounds this. When the SoC heats up, the UFS controller clock is reduced, increasing latency. A page that normally takes 200µs to read can take 2ms under thermal throttling. The tracer reveals these latency shifts because every I/O event has a precise timestamp — a histogram of `IO_COMPLETE - IO_ISSUE` across a trace shows the thermal throttling pattern as a bimodal distribution.
+
+### MGLRU on Android
+
+Android 14+ uses Multi-Generation LRU (MGLRU) as the default reclaim policy. Instead of two buckets (active/inactive), MGLRU uses 4 generations per memcg. Pages age through generations based on access patterns detected by periodic page table scans. This gives finer-grained reclaim ordering than 2Q and works better on memory-pressured phones where the difference between "accessed 1 second ago" and "accessed 30 seconds ago" matters for keeping the foreground app responsive.
+
+The tracer does not need to handle MGLRU specially — the same `mm_page_alloc`, `mm_page_free`, and reclaim events fire regardless of whether 2Q or MGLRU drives the reclaim decisions. But knowing MGLRU is active helps interpret reclaim patterns: pages may be reclaimed in a different order than you would expect from classic active/inactive reasoning.
+
+### Per-app memory limits (memcg)
+
+Android uses cgroups v2 memory controllers to enforce per-app memory limits. Each app runs in its own memory cgroup with a `memory.max` limit. When an app exceeds its limit, the kernel's memcg reclaim kicks in — reclaiming pages from that specific cgroup rather than system-wide. If reclaim cannot free enough, the OOM killer targets a process in the overcommitted cgroup.
+
+The tracer's `tgid` field on each event lets you correlate page lifecycle events with specific cgroups (since tgid → PID → cgroup mapping is available from `/proc/<pid>/cgroup`). This is how you answer "which app is causing the most reclaim activity" or "which app's pages are being compressed to zRAM most often."
 
 ---
 
