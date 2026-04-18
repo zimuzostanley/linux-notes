@@ -5,7 +5,7 @@ title: "Linux Memory Management, I/O, and eBPF: A Ground-Up Technical Walkthroug
 
 # Linux Memory Management, I/O, and eBPF: A Ground-Up Technical Walkthrough
 
-*Written for someone who knows userspace memory and I/O well but wants to see what the kernel is actually doing underneath. Every code snippet is from a real kernel tree (v6.x). No handwaving.*
+*For someone who knows userspace memory and I/O well but wants to see what the kernel is actually doing underneath. Every code snippet is from a real kernel tree (Linux 7.0-rc7).*
 
 ---
 
@@ -33,7 +33,7 @@ git checkout e774d5f1bc27a85f858bce7688509e866f8e8a4e
 
 Line numbers shift between releases — a function that is at `mm/memory.c:6589` in this tree may be at line 6601 in 7.1 or line 5932 in 6.10. Function names, parameters, and overall architecture are stable across the 6.x and 7.x series. If a line number does not match on your tree, `grep` for the function name; the structure of the code is what matters, not the exact line.
 
-The code examples are not toys. The eBPF handlers here will compile, pass the verifier, and run on a real kernel. The userspace program handles filter configuration, lifecycle reconstruction, ring buffer draining, and graceful shutdown the way a production tool does. Where I simplify, I say so.
+The eBPF handlers here will compile, pass the verifier, and run on a real kernel. The userspace program handles filter configuration, lifecycle reconstruction, ring buffer draining, and graceful shutdown. Where something is simplified, I say so.
 
 **Prerequisites.** You should be comfortable in C and have mental models for processes, virtual memory, file descriptors, and system calls. You do not need prior kernel experience — Part 1 starts at the hardware (DRAM, caches, MMU). You do not need prior eBPF experience — Part 15 explains the entire eBPF architecture from instruction format up.
 
@@ -270,11 +270,13 @@ Sets:         512 / 8 = 64 sets
 Think of it as a table with 64 rows (sets) and 8 columns (ways):
 
 ```
-         Way 0    Way 1    Way 2   ...   Way 7
-Set  0  │ line   │ line   │ line   │   │ line   │
-Set  1  │ line   │ line   │ line   │   │ line   │
-...
-Set 63  │ line   │ line   │ line   │   │ line   │
+          Way 0     Way 1     Way 2    ...    Way 7
+        ┌─────────┬─────────┬─────────┬───┬─────────┐
+Set  0  │  line   │  line   │  line   │   │  line   │
+Set  1  │  line   │  line   │  line   │   │  line   │
+  ...   │   ...   │   ...   │   ...   │   │   ...   │
+Set 63  │  line   │  line   │  line   │   │  line   │
+        └─────────┴─────────┴─────────┴───┴─────────┘
 ```
 
 A physical address is split into three fields:
@@ -647,7 +649,7 @@ VM_DONTCOPY                           — not duplicated on fork()
 
 The distinction between VM_WRITE and VM_MAYWRITE is subtle and important. A private file mapping opened read-only starts with `VM_READ | VM_MAYWRITE` — writable by mprotect but not right now. `mprotect()` checks VM_MAYWRITE before allowing PROT_WRITE. A shared mapping of a read-only file has VM_MAYWRITE unset — mprotect to writable is denied because the write would need to go back to a file the process can't write.
 
-VMAs are stored in a **maple tree** (B-tree variant) for O(log n) lookup by address. `find_vma(mm, address)` searches this tree — called on every page fault. A typical Android app has 200–500 VMAs. The maple tree replaced the older red-black tree plus linked list (`mm_rb` + `mmap`) in kernel v6.1 because the old linked list had O(n) iteration and poor cache behavior.
+VMAs are stored in `mm_mt` (the maple tree described in 4.1) for O(log n) lookup by address. `find_vma(mm, address)` searches this tree — called on every page fault. A typical Android app has 200–500 VMAs.
 
 **mmap_lock discipline:**
 
@@ -1407,7 +1409,7 @@ else
 - `MAP_PRIVATE` + writing: The kernel must make a private copy first (you should not modify the page cache version of a private mapping). This is `do_cow_fault`.
 - `MAP_SHARED` + writing: The kernel maps the page cache page writable and marks it dirty. Writes propagate back to the file. This is `do_shared_fault`.
 
-Let's trace `do_read_fault`:
+Tracing `do_read_fault`:
 
 ```c
 // mm/memory.c:5779
@@ -1534,7 +1536,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 }
 ```
 
-Two things worth noting here:
+Two points here:
 
 **The zero page optimization.** When you read from anonymous memory you have never written (e.g., the BSS segment, or freshly `mmap`'d memory), the kernel maps a single shared read-only page filled with zeros. There is exactly one zero page in the entire system, and every process's unwritten anonymous pages point to it. This means `malloc(1GB)` followed by reading it costs zero physical RAM. Only writes trigger real allocation. This is why `ps` and `/proc/pid/status` distinguish between VSS (virtual set size, how much is mapped) and RSS (resident set size, how much physical RAM is actually used).
 
@@ -2300,7 +2302,7 @@ done_merging:
 }
 ```
 
-The buddy-finding trick is elegant. Two buddies at order `n` have PFNs that differ only in bit `n`: `0...0 XXXX 0 YYYY` and `0...0 XXXX 1 YYYY`, where `YYYY` has `n` bits. `find_buddy_page_pfn` computes `buddy_pfn = pfn ^ (1 << order)` to get the buddy, and the merged block's PFN is `pfn & buddy_pfn` (the lower of the two). No pointer chasing — just arithmetic.
+The buddy-finding trick is pure arithmetic. Two buddies at order `n` have PFNs that differ only in bit `n`: `0...0 XXXX 0 YYYY` and `0...0 XXXX 1 YYYY`, where `YYYY` has `n` bits. `find_buddy_page_pfn` computes `buddy_pfn = pfn ^ (1 << order)` to get the buddy, and the merged block's PFN is `pfn & buddy_pfn` (the lower of the two). No pointer chasing — just arithmetic.
 
 The tradeoff of the buddy system: you can get fragmentation. If the kernel has thousands of free order-0 pages scattered across memory but none of them have free buddies (because their buddies are in use), you cannot satisfy a request for an order-4 (64KB) allocation even though the total free memory is enough. This is why memory compaction exists — it physically moves pages around to create contiguous free regions.
 
@@ -3958,7 +3960,7 @@ static int configure_maps(struct page_tracer_bpf *skel, struct cli_opts *opts) {
 }
 ```
 
-Two things worth noting:
+Two points:
 
 - **We write the filter before `attach`.** If we attached first, events would start flowing with a zero filter, the BPF code would early-return on every event, and we would miss the first few milliseconds of activity. Writing the filter first ensures there is no race.
 - **kptr_restrict matters.** On most distributions, `/proc/kallsyms` returns zeroed addresses unless the caller has `CAP_SYSLOG`. If you run the tracer as a non-root user with insufficient capabilities, `read_vmemmap_base` returns 0 and the tracer silently fails. The verbose warning helps debug this.
@@ -4507,7 +4509,7 @@ Until v3.16, Linux had a single request queue per block device with a single I/O
 
 The original BPF (Berkeley Packet Filter, 1992) was a simple register machine for filtering network packets. It had two 32-bit registers, a scratch memory area, and about 20 instructions.
 
-eBPF (v3.18, 2014) was a massive expansion: 10 64-bit registers, a 512-byte stack, maps for persistent storage, helper functions for accessing kernel state, and a sophisticated verifier. The key insight was that with a good enough verifier, you could safely run user-provided code inside the kernel — not just for packet filtering, but for tracing, security, scheduling, and more.
+eBPF (v3.18, 2014) expanded BPF into a general-purpose in-kernel VM: 10 64-bit registers, a 512-byte stack, maps for persistent storage, helper functions for accessing kernel state, and a verifier that proved programs safe before execution. With a good enough verifier, you can run user-provided code inside the kernel — not just for packet filtering, but for tracing, security, scheduling, and more.
 
 The verifier has grown from ~1,000 lines in v3.18 to over 20,000 lines today. Each version adds support for new patterns: bounded loops (v5.3), BPF-to-BPF function calls (v4.16), spinlocks (v5.1), ring buffers (v5.8), and BTF-based type checking that enables CO-RE portability.
 
