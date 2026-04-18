@@ -37,7 +37,7 @@ The eBPF handlers here will compile, pass the verifier, and run on a real kernel
 
 **Prerequisites.** You should be comfortable in C and have mental models for processes, virtual memory, file descriptors, and system calls. You do not need prior kernel experience — Part 1 starts at the hardware (DRAM, caches, MMU). You do not need prior eBPF experience — Part 15 explains the entire eBPF architecture from instruction format up.
 
-**How to read.** Parts 1–3 cover the hardware: DRAM organization, the cache hierarchy, and page tables. Parts 4–6 cover the kernel data structures and tools. Parts 7–14 trace the mm subsystem in motion: faults, COW, writeback, block I/O, reclaim, zRAM, migration, synchronization. Part 15 introduces eBPF. Parts 16–17 build and operate the tracer. Part 18 gives historical context for design decisions you will otherwise find arbitrary.
+**How to read.** Parts 1–3 cover the hardware: DRAM organization, the cache hierarchy, and page tables. Parts 4–6 cover the kernel data structures and tools. Parts 7–14 trace the mm subsystem in motion: faults, COW, writeback, block I/O, reclaim, zRAM, migration, synchronization. Part 15 introduces eBPF. Parts 16–17 build and operate the tracer. Part 18 covers Perfetto integration. Part 19 covers Android specifics. Part 20 gives historical context.
 
 You can read linearly, or you can jump around. If you already know hardware and mm, skip to Part 15. If you already know eBPF, skip to Part 16. The cross-references tell you what earlier sections each later section depends on.
 
@@ -66,7 +66,9 @@ Everything is licensed under the kernel's GPL-2.0 terms for the code that is quo
 15. [eBPF: Observing the Kernel From the Inside](#part-15-ebpf-observing-the-kernel-from-the-inside)
 16. [Building a Page Lifecycle Tracer with eBPF](#part-16-building-a-page-lifecycle-tracer-with-ebpf)
 17. [Operating the Tracer: Build, Run, Debug, Tune](#part-17-operating-the-tracer-build-run-debug-tune)
-18. [Historical Context: How We Got Here](#part-18-historical-context-how-we-got-here)
+18. [Perfetto Integration](#part-18-perfetto-integration)
+19. [Android-Specific Considerations](#part-19-android-specific-considerations)
+20. [Historical Context: How We Got Here](#part-20-historical-context-how-we-got-here)
 
 ---
 
@@ -568,7 +570,20 @@ On Android, where a process has many shared libraries and mmap'd files scattered
 
 ## Part 4: Kernel Data Structures — How Memory Is Described {#part-4-kernel-data-structures-how-memory-is-described}
 
-Five data structures form the backbone of the mm subsystem. Everything else builds on these, so it is worth spending time here. Read this section slowly. The tracer we build in Part 16 reaches into almost every one of these structures, and any hand-wave here becomes a bug there.
+The kernel constantly needs to answer three questions. Each question leads to a data structure.
+
+```
+Question 1: "Is page 130 of libc.so already in RAM?"
+  → page cache (xarray: address_space->i_pages)
+
+Question 2: "Which file does PFN 5000 belong to?"
+  → folio->mapping + folio->index
+
+Question 3: "Which PTEs point to PFN 5000?"
+  → reverse mapping (i_mmap for files, anon_vma for anonymous)
+```
+
+These three questions drive page faults, reclaim, writeback, migration, and COW. The structures that answer them form the backbone of the mm subsystem. The tracer we build in Part 16 reaches into almost every one of these structures, and getting them wrong produces subtly broken tracers.
 
 ### 4.1 task_struct → mm_struct
 
@@ -1073,7 +1088,87 @@ VMA → page table:               VMA provides address range, walk mm->pgd
 Process → VMAs:                 mm_struct → maple tree
 ```
 
-Keep this table handy. When reading later chapters, if you lose track of how some piece of information is being derived, come back here.
+### 4.16 The hybrid case: MAP_PRIVATE file after COW
+
+A single VMA can have BOTH `vm_file` and `anon_vma`:
+
+```
+Process mmaps libc.so MAP_PRIVATE, then writes to page 130.
+
+VMA:
+  vm_file  = libc.so          (still a file mapping)
+  anon_vma = anon_vma_X       (COW created anonymous pages)
+
+Page 129 (unmodified):
+  folio->mapping → libc's address_space (bit 0 = 0, file-backed)
+  Still in the page cache, shared with other readers
+
+Page 130 (COW'd):
+  folio->mapping → anon_vma_X | 1 (bit 0 = 1, anonymous)
+  Private copy, NOT in page cache
+  Original file page 130 still in cache for other processes
+```
+
+The kernel checks `folio->mapping` bit 0 *per page* to decide which reverse mapping path to use. Same VMA, different pages, different mechanisms.
+
+### 4.17 Side-by-side: file page vs anonymous page
+
+```
+                        FILE PAGE                  ANONYMOUS PAGE
+────────────────────────────────────────────────────────────────────
+Owner structure:        address_space              anon_vma
+
+folio->mapping:         address_space ptr          anon_vma ptr | 1
+                        (bit 0 = 0)                (bit 0 = 1)
+
+folio->index:           file page offset           virtual page number
+                        (e.g., 130)                (e.g., 0x7f500)
+
+Page cache:             YES (i_pages xarray)       NO
+
+Reverse map struct:     i_mmap (interval rbtree)   anon_vma->rb_root
+
+Virtual addr formula:   vm_start +                 folio->index × 4096
+                        (index - vm_pgoff) × 4096
+
+Why shared:             processes mmap same file    fork() shares pages
+
+Reclaim writes to:      disk (writeback)           swap/zram
+
+VMA field:              vm_file != NULL            vm_file == NULL
+                        vm_pgoff meaningful        anon_vma set
+```
+
+### 4.18 Why each structure must exist
+
+```
+Without i_pages (xarray):
+  Every file read scans all 2M page frames to find cached pages
+
+Without folio->mapping:
+  Cannot find which file a page belongs to — writeback, reverse
+  mapping, and page cache removal all break
+
+Without i_mmap:
+  Reclaim cannot find PTEs for file pages — must scan every PTE
+  in every process (hundreds of millions of checks per page)
+
+Without anon_vma:
+  Reclaim cannot find PTEs for anonymous pages — same problem
+
+Without folio->index:
+  Cannot compute virtual addresses during reverse mapping —
+  cannot find the specific PTE to clear
+
+Without the bit 0 trick:
+  Need a separate type field on folio — 8 bytes × 2M pages = 16MB
+
+Without mm_mt (maple tree):
+  Cannot find which VMA covers a faulting address —
+  cannot distinguish legitimate faults from access violations
+```
+
+Every structure exists because a specific operation would be impossibly slow without it.
 
 ---
 
@@ -2484,11 +2579,79 @@ So the tracer can observe "page PFN=X was handed to zRAM" (via a `zram_write_pag
 
 ## Part 13: Page Migration — Moving Pages Without Anyone Noticing {#part-13-page-migration-moving-pages-without-anyone-noticing}
 
-Sometimes the kernel needs to move a page from one physical address to another without changing any process's view of memory. This happens during:
+Sometimes the kernel must physically relocate a page — copy 4096 bytes from one PFN to another — without any process noticing. Three scenarios:
 
-- **Compaction**: Defragmenting physical memory to create large contiguous blocks (needed for huge pages or DMA).
-- **NUMA balancing**: Moving pages closer to the CPU that accesses them most.
-- **Memory hotplug**: Rarely relevant on phones, but the mechanism exists.
+- **Compaction:** the buddy allocator needs contiguous physical pages for large allocations (huge pages, DMA buffers). Free pages are scattered. Migration moves in-use pages out of the way to create contiguous free regions.
+- **NUMA balancing:** on multi-socket servers, a page allocated on node 0 but accessed by CPUs on node 1 should be migrated closer. Drops latency from ~100ns to ~70ns.
+- **Memory hotplug:** before physically removing a RAM module on servers, all pages on it must be migrated elsewhere.
+
+### The GFP_MOVABLE constraint
+
+Not all pages can be migrated:
+
+```
+__GFP_MOVABLE:     user pages (page cache, anonymous)
+                   Can be migrated — kernel can find and update all PTEs
+                   via reverse mapping (i_mmap or anon_vma)
+
+Not movable:       kernel pages (page tables, slab caches, kernel stacks)
+                   Cannot be migrated — raw kernel pointers exist everywhere
+                   that the kernel cannot find or update
+```
+
+The buddy allocator places movable pages in `MIGRATE_MOVABLE` freelists. Compaction only relocates these pages. This is why fragmentation is solvable for user allocations (the kernel can always move them) but fundamentally hard for kernel allocations (no reverse mapping for raw pointers).
+
+### The migration sequence
+
+Moving a page from PFN 3000 to PFN 8000, mapped by processes A and B:
+
+**Step 1:** Allocate destination page (PFN 8000).
+
+**Step 2:** Lock the source folio.
+
+**Step 3:** Replace all PTEs with migration entries:
+
+```
+Before: Process A PTE: [PFN 3000 | present]
+        Process B PTE: [PFN 3000 | present]
+
+After:  Process A PTE: [PFN 3000 | migration | not present]
+        Process B PTE: [PFN 3000 | migration | not present]
+```
+
+A migration entry is a special non-present PTE encoding. If a process accesses this address, the MMU faults, the fault handler sees the migration entry, calls `migration_entry_wait`, and the process sleeps until migration completes. The process experiences a ~10–50µs stall.
+
+**Step 4:** Copy 4096 bytes from PFN 3000 to PFN 8000. Takes ~1µs (memcpy at memory bandwidth).
+
+**Step 5:** Update destination folio's metadata — `mapping`, `index`, and flags are transferred from source.
+
+**Step 6:** If file-backed: update page cache xarray so `i_pages[index]` now points to PFN 8000's folio.
+
+**Step 7:** Replace migration entries with real PTEs pointing to PFN 8000. Wake any sleeping processes.
+
+**Step 8:** Free PFN 3000 to buddy allocator.
+
+No process noticed. No data changed. Only the physical location moved.
+
+### Why migration entries instead of just locking the folio
+
+The folio lock is a software construct — the MMU is hardware and doesn't check folio locks. If the PTE says "present and readable," the CPU reads directly through its TLB. While CPU 0 copies data to the new PFN, CPU 1 could still read through a valid PTE pointing to the old PFN. After the copy, when PFN 3000 is freed and reallocated for something else, CPU 1's cached TLB entry points to someone else's data.
+
+Migration entries solve this by making the PTE non-present at the hardware level. The MMU faults, the kernel sees the migration flag, and the process sleeps. No access to the page during migration is possible through any TLB on any CPU.
+
+### Compaction: migration in bulk
+
+Two scanners work from opposite ends of a zone's memory:
+
+```
+[used][free][used][free][used][free][used][free]
+  ↑ migrate scanner                    ↑ free scanner
+  (finds movable pages)        (finds free slots)
+```
+
+The migrate scanner picks movable pages from the low end; the free scanner picks destinations from the high end. Pages are migrated until the scanners meet. The vacated low region becomes one contiguous free block, available for high-order allocations.
+
+### The migrate_folio_move code
 
 `migrate_folio_move` at `mm/migrate.c:1353`:
 
@@ -2680,6 +2843,45 @@ set_pte_range(vmf, folio, page, nr_pages, addr); // commit
 ```
 
 This pattern minimizes the time locks are held, which is critical for scalability — you do not want to hold a spinlock while waiting for disk I/O.
+
+### Lock ordering rule
+
+Sleeping locks must be acquired before spinlocks. Never the reverse.
+
+```c
+// CORRECT
+folio_lock(folio);           // might sleep — acquired first
+spin_lock(&ptl);             // does not sleep
+spin_unlock(&ptl);
+folio_unlock(folio);
+
+// WRONG — DEADLOCK
+spin_lock(&ptl);             // preemption disabled
+folio_lock(folio);           // might need to sleep — cannot!
+```
+
+Why: spinlocks disable preemption. If you sleep while holding a spinlock, the lock is held by a sleeping task. Other CPUs spin forever waiting. The sleeping task cannot wake up because the scheduler cannot run (preemption is disabled on that CPU). Deadlock.
+
+The kernel's lockdep infrastructure automatically detects these inversions at runtime and prints a warning before the deadlock happens.
+
+### Memory barriers
+
+Write-back caches and store buffers mean writes from one CPU may not be visible to another immediately. The kernel uses explicit barriers to enforce ordering:
+
+```c
+// Producer writes data, then publishes position
+buffer[0] = 'H';
+smp_store_release(&position, new_pos);
+// guarantees: buffer write visible before position update
+
+// Consumer reads position, then reads data
+pos = smp_load_acquire(&position);
+char c = buffer[0];  // guaranteed to see 'H' if we saw new_pos
+```
+
+On ARM64 without barriers, the consumer might see the updated position but stale data — the store buffer on the producer's CPU has not drained yet. x86 has stricter default ordering (TSO — Total Store Order) but kernel code must use explicit barriers for portability.
+
+The BPF ring buffer (`kernel/bpf/ringbuf.c:463`) uses exactly this pattern: `smp_store_release(&rb->producer_pos, new_prod_pos)` after writing the record header, `smp_load_acquire(&rb->consumer_pos)` before reading consumer state. These two barriers are what make the ring buffer safe without locks.
 
 ---
 
@@ -3113,7 +3315,38 @@ A BPF program attached to a tracepoint runs this path on every event:
 7. The BPF program reads fields from `ctx`, calls helpers (`bpf_map_lookup_elem`, `bpf_ringbuf_reserve`, `bpf_ktime_get_ns`), writes output.
 8. Return from the program. Guard is decremented. Tracepoint returns.
 
-End-to-end, a well-written BPF handler on a hot tracepoint adds 100-500ns of overhead per event. That is the price of observing what the kernel is doing, from inside.
+End-to-end, a well-written BPF handler on a hot tracepoint adds 100–500ns of overhead per event.
+
+### NMI and eBPF
+
+NMI (Non-Maskable Interrupt) on x86, or pseudo-NMI via GIC priority on ARM64, cannot be blocked. BPF programs attached to perf events can run in NMI context. Constraints: no spinlocks (the interrupted code might hold them), no `wake_up` (runqueue lock deadlock), no sleeping. This is why the ring buffer uses `irq_work_queue` to defer the consumer wakeup to softirq context — calling `wake_up` from NMI would deadlock if the interrupted code holds the scheduler's runqueue lock.
+
+This also affects BPF map choice: `BPF_MAP_TYPE_HASH` with pre-allocated entries (`BPF_F_NO_PREALLOC` unset) is safe from NMI because updates never allocate memory. Dynamically-allocated hash maps are not NMI-safe.
+
+### Tracepoints vs kprobes for the tracer
+
+The full list of events the tracer needs and how each is captured:
+
+```
+Event                      Method         PFN source
+────────────────────────────────────────────────────────────
+mm_page_alloc              tracepoint     ctx->pfn (direct)
+mm_page_free               tracepoint     ctx->pfn (direct)
+mm_filemap_add_to_cache    tracepoint     ctx->pfn (direct)
+mm_filemap_delete_from_cache tracepoint   ctx->pfn (direct)
+block_rq_issue             tracepoint     sector lookup (sector_to_id map)
+block_rq_complete          tracepoint     sector lookup (sector_to_id map)
+filemap_dirty_folio        kprobe         folio → PFN (vmemmap math or kfunc)
+folio_end_writeback        kprobe         folio → PFN
+folio_end_read             kprobe         folio → PFN
+bio_add_folio              kprobe         folio → PFN + sector (populates sector_to_id)
+migrate_folio_move         kprobe         folio → PFN (both old and new)
+do_anonymous_page          kprobe         folio → PFN
+wp_page_copy               kprobe         folio → PFN (both old and new)
+zram_write_page            kprobe         page → PFN (direct function argument)
+```
+
+No kernel patches needed. Stock tracepoints cover the high-volume events (alloc, free, cache); kprobes fill the gaps where no tracepoint carries the PFN.
 
 ---
 
@@ -3190,9 +3423,28 @@ struct {
 } filter SEC(".maps");
 ```
 
-**Why a filter is not optional.** A typical Android phone allocates and frees tens of thousands of pages per second. Without filtering, the ring buffer fills up in under a second even at 64MB. The filter lets you target a specific process (`filter_type=1`) or a specific file (`filter_type=2`), reducing volume by orders of magnitude. The filter is checked early in each handler to avoid wasting cycles on pages we do not care about.
+**Why a filter is required.** A typical Android phone allocates and frees tens of thousands of pages per second. Without filtering, the ring buffer fills up in under a second even at 64MB. The filter lets you target a specific process or a specific file, reducing volume by orders of magnitude.
 
-Note that `on_page_alloc` fires before we know *what* the page is for — it could become file-backed, anonymous, slab, anything. So `on_page_alloc` can only filter by tgid (the allocating process). The ino/dev filter kicks in at `on_cache_add`, which is the earliest point where we know the file. Pages that fail the ino filter at `on_cache_add` should be retroactively cleaned out of `pfn_to_id` to avoid map bloat.
+**Why PID filtering alone breaks.** Many lifecycle events fire from kernel threads, not the app:
+
+```
+Event               Context          PID filtering works?
+─────────────────────────────────────────────────────────
+mm_page_alloc       app              yes
+page_fault          app              yes
+writeback           kworker          no
+reclaim/free        kswapd           no
+block_rq_complete   softirq          no
+migration           kcompactd        no
+```
+
+The fix: filter by PID at allocation time, then track by PFN → page_id for all subsequent events regardless of which context triggers them. Once a page is in the `pfn_to_id` map, every subsequent event on that PFN is captured no matter who fires it.
+
+**Filtering by process name.** `--comm chrome` uses `bpf_get_current_comm()` at allocation time. The handler caches `tgid → tracked` in a `tracked_tgids` hash map so the comm string comparison happens once per tgid, not once per allocation.
+
+**Filtering by file.** `--file "/usr/lib/*.so"` is resolved in userspace: `glob()` → `stat()` each match → populate a `tracked_inodes` hash map with `(ino, dev)` pairs. The eBPF handler at `on_cache_add` checks `tracked_inodes`. If no match, the page is removed from `pfn_to_id` to avoid map bloat. The user never sees inode numbers — only file paths and globs.
+
+**Filtering timing.** `on_page_alloc` fires before we know *what* the page is for — it could become file-backed, anonymous, slab, anything. So `on_page_alloc` can only filter by tgid. The ino/dev filter kicks in at `on_cache_add`, which is the earliest point where the kernel assigns the page to a file. Pages that fail the ino filter at `on_cache_add` are retroactively cleaned out of `pfn_to_id`.
 
 ### The event struct
 
@@ -4483,7 +4735,159 @@ Tuning knobs:
 
 ---
 
-## Part 18: Historical Context — How We Got Here {#part-18-historical-context-how-we-got-here}
+## Part 18: Perfetto Integration {#part-18-perfetto-integration}
+
+### Why Perfetto instead of custom JSON
+
+The tracer in Part 16 writes NDJSON from custom C. That works for prototyping but does not scale to production analysis. Perfetto replaces the custom output pipeline:
+
+```
+Ring buffer → Perfetto C SDK data source → TracePacket →
+  trace_processor → SQL → Perfetto UI
+```
+
+Benefits: timeline visualization in the Perfetto UI, SQL queries for ad-hoc analysis, standard `.perfetto-trace` format, and correlation with existing Android data sources (CPU scheduling, binder, GPU counters) in a single trace.
+
+### The architecture
+
+```
+Kernel:
+  Tracepoints + kprobes → eBPF handlers → BPF ring buffer
+
+Userspace (Perfetto C SDK data source):
+  On trace start: load eBPF, configure filters, attach
+  Poll loop: read ring buffer, emit TracePackets
+  On trace stop: detach, destroy eBPF
+
+Perfetto:
+  traced collects TracePackets
+  Trace processor creates SQL tables
+  UI visualizes timeline
+```
+
+The tracer registers as a Perfetto data source. When `traced` starts a trace with the `linux.page_lifecycle` data source enabled, the tracer loads and attaches the eBPF programs. When the trace stops, it detaches. This is the standard Perfetto data source lifecycle — the same pattern used by `traced_probes` for ftrace events.
+
+### SQL-based correlation
+
+Every event carries `page_id`. Every join is on `page_id`:
+
+```sql
+-- Full lifecycle of one page
+SELECT * FROM page_event WHERE page_id = 42 ORDER BY ts;
+
+-- Hardware I/O latency per page
+SELECT io_c.ts - io_i.ts AS hw_latency_ns
+FROM page_event io_i
+JOIN page_event io_c
+    ON io_i.page_id = io_c.page_id
+    AND io_c.type = 'IO_COMPLETE'
+WHERE io_i.type = 'IO_ISSUE';
+
+-- Cross-system: page faults during CPU scheduling slices
+SELECT pe.page_id, pe.ts, s.dur
+FROM page_event pe
+JOIN sched_slice s
+    ON pe.tgid = s.utid
+    AND pe.ts BETWEEN s.ts AND s.ts + s.dur
+WHERE pe.type = 'FAULT';
+```
+
+The power of Perfetto is that these joins work across data sources. A page fault event from the eBPF tracer can be correlated with a CPU scheduling event from ftrace and a binder transaction from atrace — all in one query, one trace file, one timeline.
+
+### Triggering on Android
+
+Perfetto is the standard tracing system on Android. `traced` and `traced_probes` run as system services. The custom data source registers with `traced` and appears in Perfetto trace configs alongside existing data sources:
+
+```
+adb shell perfetto \
+  -c - --txt <<EOF
+buffers: { size_kb: 65536 }
+data_sources: {
+  config {
+    name: "linux.page_lifecycle"
+    page_lifecycle_config {
+      filter_comm: "com.example.app"
+    }
+  }
+}
+data_sources: {
+  config { name: "linux.ftrace" }
+}
+duration_ms: 10000
+EOF
+```
+
+Both page lifecycle events and standard ftrace events in one trace. One timeline. SQL across everything.
+
+---
+
+## Part 19: Android-Specific Considerations {#part-19-android-specific-considerations}
+
+### Kernel requirements
+
+Android GKI (Generic Kernel Image) from Android 12+ has everything enabled:
+
+```
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_BPF_EVENTS=y
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_FTRACE=y
+CONFIG_KPROBES=y
+CONFIG_TRACEPOINTS=y
+```
+
+No kernel patches needed. Stock GKI works.
+
+### zRAM instead of disk swap
+
+Android uses zRAM exclusively. The tracer hooks `zram_write_page` (kprobe) to capture compression events. After compression, the page's PFN is freed — the data exists as a zsmalloc handle, not a PFN. The `page_id` survives in the `pfn_to_id` map until the page is freed.
+
+On swap-in, a new PFN is allocated. The tracer sees `EVT_ALLOC` for the new PFN. Connecting the swap-out and swap-in requires tracking the swap entry through `folio->swap` — a limitation acknowledged in Part 12.
+
+### lmkd (Low Memory Killer Daemon)
+
+Android's memory management strategy when under pressure:
+
+1. Reclaim clean file pages (free — pages can be re-read from APK/disk).
+2. Kill background apps via lmkd (frees all pages instantly — drops the entire `mm_struct` at once).
+3. Last resort: swap foreground app pages to zRAM.
+
+Killing is cheaper than swapping because it frees thousands of pages in one `exit_mmap` call instead of compressing and swapping each page individually. The tracer sees mass `EVT_FREE` events when lmkd kills an app.
+
+### Zygote and fork
+
+Android apps fork from the Zygote process. After fork, app-specific pages COW. The tracer sees:
+
+- `EVT_ALLOC` for post-fork anonymous pages.
+- `EVT_COW` when writing to shared Zygote pages (e.g., the ART runtime's boot image).
+- The COW event carries `old_page_id`, linking to the Zygote's original page.
+
+This lets you measure how much memory an app actually allocates after fork vs how much it shares with Zygote.
+
+### File paths on Android
+
+APK files contain DEX code, OAT compiled code, resources:
+
+```
+page_tracer --file "/data/app/com.example.app/base.apk"
+page_tracer --file "/data/dalvik-cache/arm64/*.odex"
+```
+
+Shared libraries:
+
+```
+page_tracer --file "/apex/com.android.runtime/lib64/bionic/libc.so"
+page_tracer --file "/system/lib64/*.so"
+```
+
+### UFS storage
+
+Android uses UFS, not NVMe. ~100–500µs typical hardware latency. FTL garbage collection causes 5–50ms spikes — the single biggest source of tail latency on Android. The tracer captures `EVT_IO_ISSUE → EVT_IO_COMPLETE` gaps that reveal these spikes directly.
+
+---
+
+## Part 20: Historical Context — How We Got Here {#part-20-historical-context-how-we-got-here}
 
 ### The evolution of struct page
 
