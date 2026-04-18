@@ -5101,7 +5101,7 @@ Ring buffer → Perfetto C SDK data source → TracePacket →
   trace_processor → SQL → Perfetto UI
 ```
 
-Benefits: timeline visualization in the Perfetto UI, SQL queries for ad-hoc analysis, standard `.perfetto-trace` format, and correlation with existing Android data sources (CPU scheduling, binder, GPU counters) in a single trace.
+Perfetto gives you timeline visualization in its UI, SQL queries for ad-hoc analysis via trace_processor, a standard `.perfetto-trace` format that tools across the Android ecosystem already consume, and the ability to correlate page lifecycle events with CPU scheduling, binder transactions, and GPU counters in a single trace file.
 
 ### The architecture
 
@@ -5161,7 +5161,7 @@ JOIN sched_slice s
 WHERE pe.type = 'FAULT';
 ```
 
-The power of Perfetto is that these joins work across data sources. A page fault event from the eBPF tracer can be correlated with a CPU scheduling event from ftrace and a binder transaction from atrace — all in one query, one trace file, one timeline.
+These joins work across data sources. A page fault event from the eBPF tracer can be correlated with a CPU scheduling event from ftrace and a binder transaction from atrace — all in one query, one trace file, one timeline.
 
 ### Triggering on Android
 
@@ -5186,7 +5186,7 @@ duration_ms: 10000
 EOF
 ```
 
-Both page lifecycle events and standard ftrace events in one trace. One timeline. SQL across everything.
+The resulting trace contains both page lifecycle events and standard ftrace events. One timeline, one SQL query surface across all data sources.
 
 ---
 
@@ -5206,23 +5206,19 @@ CONFIG_KPROBES=y
 CONFIG_TRACEPOINTS=y
 ```
 
-No kernel patches needed. Stock GKI works.
+No kernel patches are needed. Stock GKI works with all the tracepoints and kprobes the tracer requires.
 
 ### zRAM instead of disk swap
 
-Android uses zRAM exclusively. The tracer hooks `zram_write_page` (kprobe) to capture compression events. After compression, the page's PFN is freed — the data exists as a zsmalloc handle, not a PFN. The `page_id` survives in the `pfn_to_id` map until the page is freed.
+Android uses zRAM exclusively for swap. Part 12 covers zRAM internals; here we note the tracer implications. The tracer hooks `zram_write_page` via kprobe to capture compression events. After compression, the page's PFN is freed — the data exists as a zsmalloc handle, not at a PFN. The `page_id` in the `pfn_to_id` map persists until the free event cleans it up.
 
-On swap-in, a new PFN is allocated. The tracer sees `EVT_ALLOC` for the new PFN. Connecting the swap-out and swap-in requires tracking the swap entry through `folio->swap` — a limitation acknowledged in Part 12.
+On swap-in, a new PFN is allocated. The tracer sees `EVT_ALLOC` for the new PFN. Connecting the swap-out and swap-in requires tracking the swap entry through `folio->swap` — a limitation acknowledged in Part 16's swap correlation section.
 
 ### lmkd (Low Memory Killer Daemon)
 
-Android's memory management strategy when under pressure:
+When memory is tight, Android follows a priority order. First, reclaim clean file pages — these are free to evict because the data can be re-read from the APK or disk. Second, if that is not enough, kill background apps via lmkd. Killing drops the entire `mm_struct` at once — all VMAs, all page tables, all mapped pages freed in a single `exit_mmap` call. This is far cheaper than swapping each page individually. Third, as a last resort, swap foreground app pages to zRAM.
 
-1. Reclaim clean file pages (free — pages can be re-read from APK/disk).
-2. Kill background apps via lmkd (frees all pages instantly — drops the entire `mm_struct` at once).
-3. Last resort: swap foreground app pages to zRAM.
-
-Killing is cheaper than swapping because it frees thousands of pages in one `exit_mmap` call instead of compressing and swapping each page individually. The tracer sees mass `EVT_FREE` events when lmkd kills an app.
+The tracer sees mass `EVT_FREE` events when lmkd kills an app — thousands of frees in a burst, all from the same tgid. This pattern is distinctive and easy to detect in the event stream.
 
 ### Zygote and fork
 
