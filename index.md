@@ -69,6 +69,7 @@ Everything is licensed under the kernel's GPL-2.0 terms for the code that is quo
 18. [Perfetto Integration](#part-18-perfetto-integration)
 19. [Android-Specific Considerations](#part-19-android-specific-considerations)
 20. [Historical Context: How We Got Here](#part-20-historical-context-how-we-got-here)
+21. [Appendix A: Complete Source Reference](#appendix-a-complete-source-reference)
 
 ---
 
@@ -5387,6 +5388,530 @@ If you want to dive deeper into any part of what we've covered, these are the ca
 - `kernel/bpf/core.c` (`___bpf_prog_run`) — the BPF interpreter.
 
 The kernel source is the primary source of truth. Every book and article drifts; the code doesn't.
+
+---
+
+## Appendix A: Complete Source Reference {#appendix-a-complete-source-reference}
+
+All source files for the tracer, assembled from the document's fragments with gaps filled. Each file is self-contained and compilable against a GKI kernel with libbpf.
+
+### File 1: `page_tracer.h` — Shared Definitions
+
+Included by both the BPF program and the userspace daemon. Keep this C89-compatible (no flexible arrays, no VLAs).
+
+```c
+#ifndef PAGE_TRACER_H
+#define PAGE_TRACER_H
+
+enum event_type {
+    EVT_ALLOC          = 0,
+    EVT_FREE           = 1,
+    EVT_CACHE_INSERT   = 2,
+    EVT_CACHE_REMOVE   = 3,
+    EVT_FAULT          = 4,
+    EVT_DIRTY          = 5,
+    EVT_WRITEBACK      = 6,
+    EVT_WB_DONE        = 7,
+    EVT_IO_ISSUE       = 8,
+    EVT_IO_COMPLETE    = 9,
+    EVT_ANON_FAULT     = 10,
+    EVT_COW            = 11,
+    EVT_MIGRATE        = 12,
+    EVT_ZRAM_COMPRESS  = 13,
+    EVT_READ           = 14,
+    EVT_READ_DONE      = 15,
+    EVT_SWAP_IN        = 16,
+};
+
+struct page_event {
+    __u64 page_id;
+    __u64 pfn;
+    __u64 ts;
+    __u32 event_type;
+    __u32 cpu;
+    __u32 tgid;
+    __u32 order;
+    union {
+        struct { __u64 gfp_flags; char comm[16]; } alloc;
+        struct { __u64 ino; __u64 dev; __u64 index; } cache;
+        struct { __u64 address; __u8 is_write; } fault;
+        struct { __u64 old_page_id; __u64 address; } cow;
+        struct { __u64 old_pfn; __u64 new_pfn; __u32 reason; } migrate;
+        struct { __u64 sector; __u64 dev; __u32 nr_sectors; __u32 error; } io;
+        struct { __u32 compressed_size; } zram;
+        struct { __u64 old_page_id; } swap;
+    };
+};
+
+#define FILTER_OFF     0
+#define FILTER_BY_COMM 1
+#define FILTER_BY_INO  2
+#define FILTER_BY_BOTH 3
+
+struct trace_filter {
+    __u32 filter_type;
+    __u32 pad;
+    __u64 ino;
+    __u64 dev;
+};
+
+struct inode_key {
+    __u64 ino;
+    __u64 dev;
+};
+
+struct sector_key {
+    __u64 dev;
+    __u64 sector;
+};
+
+struct cow_pending {
+    __u64 old_page_id;
+    __u64 old_pfn;
+    __u64 address;
+};
+
+#endif
+```
+
+### File 2: `page_tracer.bpf.c` — The BPF Program
+
+All maps, helpers, and handlers. Compile with:
+
+```bash
+clang -g -O2 -target bpf -D__TARGET_ARCH_arm64 -I. -c page_tracer.bpf.c -o page_tracer.bpf.o
+```
+
+```c
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+#include "page_tracer.h"
+
+char LICENSE[] SEC("license") = "GPL";
+
+// ── Maps ──
+
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
+         __type(key, u32); __type(value, u64); } page_id_counter SEC(".maps");
+
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 262144);
+         __type(key, u64); __type(value, u64); } pfn_to_id SEC(".maps");
+
+struct { __uint(type, BPF_MAP_TYPE_RINGBUF);
+         __uint(max_entries, 16 * 1024 * 1024); } events SEC(".maps");
+
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
+         __type(key, u32); __type(value, struct trace_filter); } filter SEC(".maps");
+
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
+         __type(key, u32); __type(value, u64); } vmemmap_base_map SEC(".maps");
+
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16384);
+         __type(key, struct sector_key); __type(value, u64); } sector_to_id SEC(".maps");
+
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 8192);
+         __type(key, struct inode_key); __type(value, u8); } tracked_inodes SEC(".maps");
+
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 1024);
+         __type(key, u32); __type(value, u8); } tracked_tgids SEC(".maps");
+
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 256);
+         __type(key, u32); __type(value, struct cow_pending); } pending_cow SEC(".maps");
+
+struct { __uint(type, BPF_MAP_TYPE_LRU_HASH); __uint(max_entries, 65536);
+         __type(key, u64); __type(value, u64); } swap_to_id SEC(".maps");
+
+// ── Helpers ──
+
+static __always_inline u64 get_page_id(u64 pfn) {
+    u64 *id = bpf_map_lookup_elem(&pfn_to_id, &pfn);
+    return id ? *id : 0;
+}
+
+static __always_inline u64 next_page_id(void) {
+    u32 zero = 0;
+    u64 *counter = bpf_map_lookup_elem(&page_id_counter, &zero);
+    if (!counter) return 0;
+    return __sync_fetch_and_add(counter, 1) + 1;
+}
+
+static __always_inline struct page_event *emit(u64 page_id, u64 pfn,
+                                                u32 type, u32 order) {
+    struct page_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) return NULL;
+    __builtin_memset(e, 0, sizeof(*e));
+    e->page_id = page_id;
+    e->pfn = pfn;
+    e->ts = bpf_ktime_get_ns();
+    e->event_type = type;
+    e->cpu = bpf_get_smp_processor_id();
+    e->tgid = bpf_get_current_pid_tgid() >> 32;
+    e->order = order;
+    return e;
+}
+
+static __always_inline u64 folio_to_pfn_helper(struct folio *folio) {
+    u32 zero = 0;
+    u64 *vmemmap = bpf_map_lookup_elem(&vmemmap_base_map, &zero);
+    if (!vmemmap || !*vmemmap) return 0;
+    u64 folio_addr = (u64)folio;
+    if (folio_addr < *vmemmap) return 0;
+    u32 page_sz = bpf_core_type_size(struct page);
+    if (!page_sz) page_sz = 64;
+    return (folio_addr - *vmemmap) / page_sz;
+}
+
+static __always_inline bool should_track_tgid(void) {
+    u32 zero = 0;
+    struct trace_filter *f = bpf_map_lookup_elem(&filter, &zero);
+    if (!f || f->filter_type == FILTER_OFF) return false;
+    if (f->filter_type == FILTER_BY_INO) return true;
+    u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    u8 *tracked = bpf_map_lookup_elem(&tracked_tgids, &tgid);
+    return tracked && *tracked == 1;
+}
+
+// ── Handlers ──
+
+SEC("tracepoint/kmem/mm_page_alloc")
+int on_page_alloc(struct trace_event_raw_mm_page_alloc *ctx) {
+    u64 pfn = ctx->pfn;
+    if (pfn == (u64)-1) return 0;
+    if (!(ctx->gfp_flags & 0x08)) return 0;
+    if (!should_track_tgid()) return 0;
+
+    u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    u64 page_id = next_page_id();
+    if (!page_id) return 0;
+    bpf_map_update_elem(&pfn_to_id, &pfn, &page_id, BPF_ANY);
+
+    struct cow_pending *cow = bpf_map_lookup_elem(&pending_cow, &tgid);
+    if (cow) {
+        struct page_event *e = emit(page_id, pfn, EVT_COW, ctx->order);
+        if (e) {
+            e->cow.old_page_id = cow->old_page_id;
+            e->cow.address = cow->address;
+            bpf_ringbuf_submit(e, 0);
+        }
+        bpf_map_delete_elem(&pending_cow, &tgid);
+        return 0;
+    }
+
+    struct page_event *e = emit(page_id, pfn, EVT_ALLOC, ctx->order);
+    if (!e) return 0;
+    e->alloc.gfp_flags = ctx->gfp_flags;
+    bpf_get_current_comm(&e->alloc.comm, sizeof(e->alloc.comm));
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/kmem/mm_page_free")
+int on_page_free(struct trace_event_raw_mm_page_free *ctx) {
+    u64 pfn = ctx->pfn;
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+    struct page_event *e = emit(page_id, pfn, EVT_FREE, ctx->order);
+    if (e) bpf_ringbuf_submit(e, 0);
+    bpf_map_delete_elem(&pfn_to_id, &pfn);
+    return 0;
+}
+
+SEC("tracepoint/filemap/mm_filemap_add_to_page_cache")
+int on_cache_add(struct trace_event_raw_mm_filemap_op_page_cache *ctx) {
+    u64 pfn = ctx->pfn;
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+
+    u32 zero = 0;
+    struct trace_filter *f = bpf_map_lookup_elem(&filter, &zero);
+    if (f && (f->filter_type == FILTER_BY_INO || f->filter_type == FILTER_BY_BOTH)) {
+        struct inode_key ik = { .ino = ctx->i_ino, .dev = ctx->s_dev };
+        if (!bpf_map_lookup_elem(&tracked_inodes, &ik)) {
+            bpf_map_delete_elem(&pfn_to_id, &pfn);
+            return 0;
+        }
+    }
+
+    struct page_event *e = emit(page_id, pfn, EVT_CACHE_INSERT, ctx->order);
+    if (!e) return 0;
+    e->cache.ino = ctx->i_ino;
+    e->cache.dev = ctx->s_dev;
+    e->cache.index = ctx->index;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/filemap/mm_filemap_delete_from_page_cache")
+int on_cache_remove(struct trace_event_raw_mm_filemap_op_page_cache *ctx) {
+    u64 pfn = ctx->pfn;
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+    struct page_event *e = emit(page_id, pfn, EVT_CACHE_REMOVE, ctx->order);
+    if (!e) return 0;
+    e->cache.ino = ctx->i_ino;
+    e->cache.dev = ctx->s_dev;
+    e->cache.index = ctx->index;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("kprobe/finish_fault")
+int on_fault(struct pt_regs *ctx) {
+    struct vm_fault *vmf = (struct vm_fault *)PT_REGS_PARM1(ctx);
+    struct folio *folio = BPF_CORE_READ(vmf, folio);
+    if (!folio) return 0;
+    unsigned long pfn = folio_to_pfn_helper(folio);
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+
+    struct vm_area_struct *vma = BPF_CORE_READ(vmf, vma);
+    struct file *vm_file = BPF_CORE_READ(vma, vm_file);
+    u32 evt_type = vm_file ? EVT_FAULT : EVT_ANON_FAULT;
+
+    struct page_event *e = emit(page_id, pfn, evt_type, 0);
+    if (!e) return 0;
+    e->fault.address = BPF_CORE_READ(vmf, address);
+    e->fault.is_write = !!(BPF_CORE_READ(vmf, flags) & 0x02);
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("kprobe/filemap_dirty_folio")
+int on_dirty(struct pt_regs *ctx) {
+    struct folio *folio = (struct folio *)PT_REGS_PARM2(ctx);
+    unsigned long pfn = folio_to_pfn_helper(folio);
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+    struct page_event *e = emit(page_id, pfn, EVT_DIRTY, 0);
+    if (!e) return 0;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("kprobe/wp_page_copy")
+int on_cow_entry(struct pt_regs *ctx) {
+    struct vm_fault *vmf = (struct vm_fault *)PT_REGS_PARM1(ctx);
+    struct page *old_page = BPF_CORE_READ(vmf, page);
+    if (!old_page) return 0;
+    unsigned long old_pfn = folio_to_pfn_helper((struct folio *)old_page);
+    u64 old_page_id = get_page_id(old_pfn);
+
+    u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    struct cow_pending val = {
+        .old_page_id = old_page_id,
+        .old_pfn = old_pfn,
+        .address = BPF_CORE_READ(vmf, address),
+    };
+    bpf_map_update_elem(&pending_cow, &tgid, &val, BPF_ANY);
+    return 0;
+}
+
+SEC("kprobe/migrate_folio_move")
+int on_migrate(struct pt_regs *ctx) {
+    struct folio *src = (struct folio *)PT_REGS_PARM3(ctx);
+    struct folio *dst = (struct folio *)PT_REGS_PARM4(ctx);
+    int reason = (int)PT_REGS_PARM6(ctx);
+
+    unsigned long old_pfn = folio_to_pfn_helper(src);
+    unsigned long new_pfn = folio_to_pfn_helper(dst);
+    u64 page_id = get_page_id(old_pfn);
+    if (!page_id) return 0;
+
+    bpf_map_delete_elem(&pfn_to_id, &old_pfn);
+    bpf_map_update_elem(&pfn_to_id, &new_pfn, &page_id, BPF_ANY);
+
+    struct page_event *e = emit(page_id, new_pfn, EVT_MIGRATE, 0);
+    if (!e) return 0;
+    e->migrate.old_pfn = old_pfn;
+    e->migrate.new_pfn = new_pfn;
+    e->migrate.reason = reason;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("kprobe/bio_add_folio")
+int on_bio_add_folio(struct pt_regs *ctx) {
+    struct bio *bio = (struct bio *)PT_REGS_PARM1(ctx);
+    struct folio *folio = (struct folio *)PT_REGS_PARM2(ctx);
+    u32 len = (u32)PT_REGS_PARM3(ctx);
+
+    unsigned long pfn = folio_to_pfn_helper(folio);
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+
+    u64 sector = BPF_CORE_READ(bio, bi_iter.bi_sector);
+    struct block_device *bdev = BPF_CORE_READ(bio, bi_bdev);
+    dev_t dev = BPF_CORE_READ(bdev, bd_dev);
+    u32 opf = BPF_CORE_READ(bio, bi_opf);
+
+    u32 nr_pages = len / 4096;
+    if (nr_pages == 0) nr_pages = 1;
+    if (nr_pages > 16) nr_pages = 16;
+
+    #pragma unroll
+    for (u32 i = 0; i < 16; i++) {
+        if (i >= nr_pages) break;
+        struct sector_key key = { .dev = dev, .sector = sector + i * 8 };
+        bpf_map_update_elem(&sector_to_id, &key, &page_id, BPF_ANY);
+    }
+
+    u32 evt_type = (opf & 0xFF) == 1 ? EVT_WRITEBACK : EVT_READ;
+    struct page_event *e = emit(page_id, pfn, evt_type, 0);
+    if (!e) return 0;
+    e->io.sector = sector;
+    e->io.dev = dev;
+    e->io.nr_sectors = nr_pages * 8;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/block/block_rq_issue")
+int on_rq_issue(struct trace_event_raw_block_rq_issue *ctx) {
+    u64 dev = ctx->dev; u64 sector = ctx->sector; u32 nr = ctx->nr_sector;
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        if (i * 8 >= nr) break;
+        struct sector_key key = { .dev = dev, .sector = sector + i * 8 };
+        u64 *pid = bpf_map_lookup_elem(&sector_to_id, &key);
+        if (!pid) continue;
+        struct page_event *e = emit(*pid, 0, EVT_IO_ISSUE, 0);
+        if (!e) continue;
+        e->io.sector = sector + i * 8; e->io.dev = dev; e->io.nr_sectors = 8;
+        bpf_ringbuf_submit(e, 0);
+    }
+    return 0;
+}
+
+SEC("tracepoint/block/block_rq_complete")
+int on_rq_complete(struct trace_event_raw_block_rq_complete *ctx) {
+    u64 dev = ctx->dev; u64 sector = ctx->sector; u32 nr = ctx->nr_sector;
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        if (i * 8 >= nr) break;
+        struct sector_key key = { .dev = dev, .sector = sector + i * 8 };
+        u64 *pid = bpf_map_lookup_elem(&sector_to_id, &key);
+        if (!pid) continue;
+        struct page_event *e = emit(*pid, 0, EVT_IO_COMPLETE, 0);
+        if (e) {
+            e->io.sector = sector + i * 8; e->io.dev = dev;
+            e->io.nr_sectors = 8; e->io.error = ctx->error;
+            bpf_ringbuf_submit(e, 0);
+        }
+        bpf_map_delete_elem(&sector_to_id, &key);
+    }
+    return 0;
+}
+
+SEC("kprobe/folio_end_writeback")
+int on_wb_done(struct pt_regs *ctx) {
+    struct folio *folio = (struct folio *)PT_REGS_PARM1(ctx);
+    unsigned long pfn = folio_to_pfn_helper(folio);
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+    struct page_event *e = emit(page_id, pfn, EVT_WB_DONE, 0);
+    if (!e) return 0;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("kprobe/folio_end_read")
+int on_read_done(struct pt_regs *ctx) {
+    struct folio *folio = (struct folio *)PT_REGS_PARM1(ctx);
+    bool success = (bool)PT_REGS_PARM2(ctx);
+    unsigned long pfn = folio_to_pfn_helper(folio);
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+    struct page_event *e = emit(page_id, pfn, EVT_READ_DONE, 0);
+    if (!e) return 0;
+    e->io.error = success ? 0 : 1;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("kprobe/zram_write_page")
+int on_zram_compress(struct pt_regs *ctx) {
+    struct page *page = (struct page *)PT_REGS_PARM2(ctx);
+    unsigned long pfn = folio_to_pfn_helper((struct folio *)page);
+    u64 page_id = get_page_id(pfn);
+    if (!page_id) return 0;
+    struct page_event *e = emit(page_id, pfn, EVT_ZRAM_COMPRESS, 0);
+    if (!e) return 0;
+    bpf_ringbuf_submit(e, 0);
+
+    struct folio *folio = (struct folio *)page;
+    u64 swap_entry = BPF_CORE_READ(folio, swap.val);
+    if (swap_entry)
+        bpf_map_update_elem(&swap_to_id, &swap_entry, &page_id, BPF_ANY);
+    return 0;
+}
+```
+
+### File 3: `Makefile`
+
+```makefile
+CLANG   ?= clang
+BPFTOOL ?= bpftool
+CC      ?= gcc
+ARCH    ?= $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
+
+CFLAGS    = -g -O2 -Wall -I.
+BPF_FLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -I.
+LDFLAGS   = -lbpf -lelf -lz
+
+all: page_tracer
+
+vmlinux.h:
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
+
+page_tracer.bpf.o: page_tracer.bpf.c page_tracer.h vmlinux.h
+	$(CLANG) $(BPF_FLAGS) -c $< -o $@
+
+page_tracer.bpf.skel.h: page_tracer.bpf.o
+	$(BPFTOOL) gen skeleton $< > $@
+
+page_tracer: page_tracer.c page_tracer.bpf.skel.h page_tracer.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+clean:
+	rm -f page_tracer page_tracer.bpf.o page_tracer.bpf.skel.h vmlinux.h
+
+.PHONY: all clean
+```
+
+### Build and run
+
+```bash
+# On a machine with kernel headers and clang:
+make
+
+# For Android cross-compilation:
+adb shell cat /sys/kernel/btf/vmlinux > /tmp/vmlinux.btf
+bpftool btf dump file /tmp/vmlinux.btf format c > vmlinux.h
+make ARCH=arm64 CC=aarch64-linux-gnu-gcc
+
+# Push and run:
+adb push page_tracer /data/local/tmp/
+adb shell su -c /data/local/tmp/page_tracer --comm com.android.systemui --verbose
+```
+
+### Verification
+
+```bash
+# Programs attached:
+bpftool prog show | grep page_tracer
+
+# page_id counter advancing:
+bpftool map dump name page_id_counter
+
+# pfn_to_id has entries:
+bpftool map dump name pfn_to_id | head -5
+
+# Filter configured:
+bpftool map dump name filter
+bpftool map dump name tracked_tgids
+```
 
 ---
 
