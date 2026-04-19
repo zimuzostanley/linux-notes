@@ -1894,7 +1894,7 @@ The `folio_wake_bit` call is important — other parts of the kernel (like `fsyn
 
 ## Part 10: The VFS and Filesystem Layer {#part-10-the-vfs-and-filesystem-layer}
 
-Between "look up page in page cache" and "submit bio to block layer," there is a layer the mm chapters cover quickly: the filesystem. This is where file offsets become disk sectors, where metadata is managed, and where the filesystem's on-disk layout affects I/O patterns.
+Between "look up page in page cache" and "submit bio to block layer," there is a critical translation layer: the filesystem. This is where file offsets become disk sectors, where metadata is managed, and where the filesystem's on-disk layout affects I/O patterns.
 
 ```
 Userspace:     read(fd, buf, 4096)
@@ -2005,8 +2005,6 @@ a_ops->dirty_folio       EVT_DIRTY              page marked dirty
 To trace filesystem-specific operations (journal commits, f2fs GC, extent allocation), add kprobes on fs-specific functions. These would be additional events, separate from the page lifecycle but correlatable by timestamp and tgid.
 
 ---
-
-
 ## Part 11: The Block I/O Layer — From Pages to Sectors {#part-11-the-block-io-layer-from-pages-to-sectors}
 
 The block layer sits between the filesystem and the disk driver. Its job is to take `bio` structs from the filesystem and deliver them to the hardware efficiently. This section traces the full read and write paths from userspace syscalls down to hardware and back, because you cannot build a useful tracer without understanding both directions.
@@ -3024,8 +3022,6 @@ Why this matters for mm: a BPF scheduler can access `task_struct→mm→rss_stat
 **Futex / mutex.** When a thread blocks on a futex, it calls `schedule()`. When the holder unlocks, `futex_wake` wakes the blocked thread. If the blocked thread has a smaller vruntime, it may preempt the unlocking thread immediately.
 
 ---
-
-
 ## Part 16: Synchronization — How the mm Subsystem Stays Sane {#part-16-synchronization-how-the-mm-subsystem-stays-sane}
 
 Multiple CPUs can fault on the same page simultaneously. Reclaim can try to evict a page while a process is mapping it. Writeback can be writing a page while the process is dirtying it again. The mm subsystem uses a layered locking strategy to handle all of this.
