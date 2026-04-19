@@ -37,7 +37,7 @@ The eBPF handlers here will compile, pass the verifier, and run on a real kernel
 
 **Prerequisites.** You should be comfortable in C and have mental models for processes, virtual memory, file descriptors, and system calls. You do not need prior kernel experience — Part 1 starts at the hardware (DRAM, caches, MMU). You do not need prior eBPF experience — Part 17 explains the entire eBPF architecture from instruction format up.
 
-**How to read.** Parts 1–3 cover the hardware: DRAM, the cache hierarchy, and page tables. Parts 4–6 cover the kernel data structures and tools. Parts 7–9 trace faults, COW, and writeback. Part 10 covers the VFS and filesystem layer. Part 11 covers block I/O. Parts 12–14 cover reclaim, zRAM, and page migration. Part 15 covers the scheduler and how it interacts with mm. Part 16 covers synchronization. Part 17 introduces eBPF. Parts 18–19 build and operate the tracer. Part 20 covers Perfetto integration. Part 21 covers Android specifics. Part 22 gives historical context. Appendix A has the complete tracer source.
+**How to read.** Parts 1–3 cover the hardware: DRAM, the cache hierarchy, and page tables. Parts 4–6 cover the kernel data structures and tools. Parts 7–9 trace faults, COW, and writeback. Part 10 covers the VFS and filesystem layer. Part 11 covers block I/O. Parts 12–14 cover reclaim, zRAM, and page migration. Part 15 covers the scheduler and how it interacts with mm. Part 16 covers synchronization. Part 17 introduces eBPF. Parts 18–19 build and operate the tracer. Part 20 covers Perfetto integration. Part 21 covers Android specifics. Part 22 gives historical context. Parts 23–24 cover DMA-buf and the network stack — how pages move between hardware and carry packets. Part 25 dives deep into f2fs, ext4, and erofs. Appendix A has the complete tracer source.
 
 You can read linearly, or you can jump around. If you already know hardware and mm, skip to Part 17. If you already know eBPF, skip to Part 18.
 
@@ -71,7 +71,10 @@ Everything is licensed under the kernel's GPL-2.0 terms for the code that is quo
 20. [Perfetto Integration](#part-20-perfetto-integration)
 21. [Android-Specific Considerations](#part-21-android-specific-considerations)
 22. [Historical Context: How We Got Here](#part-22-historical-context-how-we-got-here)
-23. [Appendix A: Complete Source Reference](#appendix-a-complete-source-reference)
+23. [DMA-buf: How Pages Move Between Hardware](#part-23-dma-buf-how-pages-move-between-hardware)
+24. [Network Stack: How Pages Carry Packets](#part-24-network-stack-how-pages-carry-packets)
+25. [Filesystem Deep Dive: f2fs, ext4, erofs](#part-25-filesystem-deep-dive-f2fs-ext4-erofs)
+26. [Appendix A: Complete Source Reference](#appendix-a-complete-source-reference)
 
 ---
 
@@ -433,7 +436,7 @@ dma_sync_single_for_cpu(dev, addr, size, DMA_FROM_DEVICE);
 
 **Coherent DMA:** for frequently shared memory (ring buffers between CPU and device), the kernel maps pages as **uncacheable** via PTE flags. Every access goes directly to RAM (~100ns vs ~2ns), but no sync calls are needed. This is the right tradeoff for small control regions; for bulk data (network packets, disk blocks), explicit sync on cacheable memory wins.
 
-Architectures differ significantly: x86 has cache-coherent DMA by default (the fabric snoops caches), so many `dma_sync_*` calls are no-ops. ARM64 and most embedded architectures are not coherent — the sync calls translate to real cache maintenance instructions. The kernel's DMA API hides this difference so drivers work identically on both.
+Architectures differ significantly: x86 has cache-coherent DMA by default (the fabric snoops caches), so many `dma_sync_*` calls are no-ops. ARM64 and most embedded architectures are not coherent — the sync calls translate to real cache maintenance instructions. The kernel's DMA API hides this difference so drivers work identically on both. Part 23 covers DMA-buf — how pages are shared between multiple hardware blocks (camera, GPU, display) with proper cache synchronization and fence-based ordering.
 
 ---
 
@@ -2002,7 +2005,7 @@ a_ops->writepages        EVT_WRITEBACK          bio built for dirty page
 a_ops->dirty_folio       EVT_DIRTY              page marked dirty
 ```
 
-To trace filesystem-specific operations (journal commits, f2fs GC, extent allocation), add kprobes on fs-specific functions. These would be additional events, separate from the page lifecycle but correlatable by timestamp and tgid.
+To trace filesystem-specific operations (journal commits, f2fs GC, extent allocation), add kprobes on fs-specific functions. These would be additional events, separate from the page lifecycle but correlatable by timestamp and tgid. Part 25 covers f2fs, ext4, and erofs internals — the NAT, extent trees, log-structured writes, compression, GC, and crash consistency mechanisms.
 
 ---
 ## Part 11: The Block I/O Layer — From Pages to Sectors {#part-11-the-block-io-layer-from-pages-to-sectors}
@@ -5596,6 +5599,207 @@ If you want to dive deeper into any part of what we've covered, these are the ca
 - `kernel/bpf/core.c` (`___bpf_prog_run`) — the BPF interpreter.
 
 The kernel source is the primary source of truth. Every book and article drifts; the code doesn't.
+
+---
+
+## Part 23: DMA-buf — How Pages Move Between Hardware {#part-23-dma-buf-how-pages-move-between-hardware}
+
+When a camera sensor captures a frame, the ISP processes it, the GPU applies filters, the video encoder compresses it, and the display controller shows the preview. Each is a separate hardware block with its own DMA engine. The frame data — 18MB for a 12MP YUV frame — must be accessible to all of them without copying. At 30fps, copying between stages would consume 1.6GB/s of pure memcpy.
+
+DMA-buf wraps a set of physical pages in a kernel object (`struct dma_buf` at `include/linux/dma-buf.h:294`) backed by a file descriptor. The fd provides lifetime management via reference counting. The export/import protocol handles address space translation across IOMMUs. The sync/fence APIs manage cache coherency and ordering between hardware stages.
+
+### The IOMMU
+
+The MMU translates CPU virtual addresses to physical addresses (Part 3). The **IOMMU** does the same for DMA devices. A device behind an IOMMU generates **I/O virtual addresses (IOVAs)**, and the IOMMU translates them to physical addresses. This means scattered physical pages can appear contiguous to the device:
+
+```
+Physical pages: 0x10000000, 0x20040000, 0x10100000 (scattered)
+
+IOMMU mapping for GPU:
+  IOVA 0x80000000 → physical 0x10000000
+  IOVA 0x80001000 → physical 0x20040000
+  IOVA 0x80002000 → physical 0x10100000
+
+GPU sees: contiguous 12KB buffer at IOVA 0x80000000
+```
+
+Without an IOMMU, the device uses raw physical addresses. A buggy driver or malicious device can DMA to any physical address — overwriting kernel code, page tables, or other processes' data. The IOMMU restricts each device to only the physical pages it has been explicitly mapped to.
+
+### Where DMA-buf pages come from
+
+`dma_heap` (kernel 5.6+, replacing Android's ION) allocates pages. The **system heap** at `drivers/dma-buf/heaps/system_heap.c` uses a cascading order strategy:
+
+```c
+// drivers/dma-buf/heaps/system_heap.c:52
+static const unsigned int orders[] = {8, 4, 0};
+```
+
+It tries order-8 (1MB) first for fewer scatter-gather entries and longer DMA bursts. Falls back to order-4 (64KB) on fragmented memory, then order-0 (4KB) as last resort. An 8MB buffer on a fresh system: 8 order-8 allocations. On a fragmented system: a mix producing a longer scatter-gather list.
+
+### Cache coherency
+
+On ARM64, DMA is not cache-coherent (Part 2.9). Every ownership transition between CPU and device requires explicit cache maintenance. `dma_sync_sg_for_device` cleans (flushes) dirty cache lines to RAM before a device reads. `dma_sync_sg_for_cpu` invalidates cache lines before the CPU reads device-written data. For an 8MB buffer, that is 131,072 cache line operations — ~200µs on a big core.
+
+Userspace triggers sync via `DMA_BUF_IOCTL_SYNC` before and after CPU access. Forgetting this ioctl causes intermittent corruption — the CPU reads stale cache lines instead of fresh device data.
+
+### Fences: hardware-to-hardware ordering
+
+A `dma_fence` (at `include/linux/dma-fence.h:67`) represents a future hardware completion. When the camera finishes writing a frame, it signals a fence. The GPU's command stream contains a wait instruction for that fence — the GPU hardware stalls until the fence signals, then proceeds. The CPU is not involved in the actual wait.
+
+Each dma_buf has a `struct dma_resv` holding associated fences. Writers add exclusive fences; readers add shared fences. A writer waits for all previous readers and writers. A reader waits only for the previous writer. Standard reader-writer synchronization, implemented in hardware.
+
+Android uses explicit fences passed as `sync_file` file descriptors. SurfaceFlinger receives a fence fd from each app alongside the GraphicBuffer. The fence indicates when the app's GPU rendering will complete. SurfaceFlinger (or HWC) waits on this fence before scanning out the buffer to the display.
+
+### The Android graphics pipeline
+
+```
+App renders → GPU draws into GraphicBuffer (wraps dma_buf fd)
+  → GPU produces fence F_app
+  → queueBuffer(buffer, F_app) via Binder to SurfaceFlinger
+  → SurfaceFlinger composites (GPU waits on each app's fence)
+  → produces fence F_sf → passes to HWC
+  → display controller waits on F_sf in hardware
+  → scans buffer on vsync → signals release fence
+  → app reuses buffer for next frame
+```
+
+Zero CPU copies of pixel data. Every transfer is a dma_buf fd handoff. Every synchronization is a hardware fence wait.
+
+### DMA-buf and the tracer
+
+DMA-buf pages are outside the tracer's current scope. They are allocated via `alloc_pages` internally (so `mm_page_alloc` fires), but immediately pinned — not on any LRU, not in the page cache, not reclaimable. The tracer sees `EVT_ALLOC` with no subsequent lifecycle events. To trace DMA-buf lifecycle, hook the DMA-buf API directly: `dma_heap_buffer_alloc`, `dma_buf_attach`, `dma_buf_map_attachment`, `dma_fence_signal`, `dma_buf_release`.
+
+---
+
+## Part 24: Network Stack — How Pages Carry Packets {#part-24-network-stack-how-pages-carry-packets}
+
+Filesystem I/O and network I/O both move data between userspace and hardware using pages. But the patterns differ: file pages live for seconds to hours in the page cache; network pages live for microseconds during packet transit. File pages are 4KB, matching disk blocks well; packets are 64–1500 bytes, wasting most of a page. The allocation rate for network can reach millions per second on busy servers.
+
+### sk_buff: the packet descriptor
+
+Every packet in the kernel is described by `struct sk_buff` (at `include/linux/skbuff.h:885`). It has two data regions:
+
+**Linear data** (the `head` to `end` buffer): a contiguous slab-allocated buffer (256B–2KB) holding protocol headers — Ethernet (14B), IP (20B), TCP (20B). Protocol processing modifies headers extensively (checksum computation, routing lookup, netfilter inspection), so headers must be contiguous.
+
+**Paged data** (the `frags[]` array): for payloads larger than the linear buffer. Each frag is a `(page, offset, length)` tuple. The page holds payload bytes that don't need header-level manipulation — just data being moved from one place to another.
+
+A typical received TCP packet: 54 bytes of headers in the linear region, 1406 bytes of payload in `frags[0]` — same page, different offsets.
+
+### page_pool: bypassing the buddy allocator
+
+The NIC receive path needs a fresh page for every packet to refill the receive ring. At 1M packets/sec, calling `alloc_pages` for each — with its zone lock, watermark check, freelist walk — costs 100–300ms of CPU per second.
+
+`page_pool` (at `include/net/page_pool/types.h:167`) eliminates this overhead. A per-CPU array of 128 pre-allocated pages serves as a fast cache. Allocation is one array index decrement (~5ns). In steady state, pages cycle: alloc from cache → NIC DMAs into page → stack processes → free back to cache. The buddy allocator is never touched.
+
+The tracer sees the initial pool fill (128 `mm_page_alloc` events) and the final drain (128 `mm_page_free` events). The millions of per-packet reuses in between are invisible — the pages never leave the pool.
+
+### The receive path
+
+```
+NIC hardware: packet arrives → DMA into pre-allocated page → interrupt
+Driver (NAPI): build sk_buff pointing to page → napi_gro_receive
+  → refill ring slot with page_pool_alloc
+GRO: coalesce small TCP segments into one large sk_buff (10× fewer)
+IP/TCP: route lookup, firewall, sequence check, ACK processing
+Socket: sk_buff queued on sk->sk_receive_queue
+recv(): skb_copy_datagram_msg → copies payload to userspace → frees sk_buff
+  → page returned to page_pool
+```
+
+The copy in `skb_copy_datagram_msg` is the main overhead. Everything before it is pointer manipulation — the packet data stays in the original page the NIC DMA'd into.
+
+### sendfile: zero-copy send
+
+`sendfile(sock_fd, file_fd, &offset, count)` builds sk_buffs with frags pointing directly to page cache pages. The NIC DMAs from the page cache page — no intermediate buffer. The page cache page participates in three systems simultaneously: the page cache (xarray ref), the socket's send buffer (sk_buff frag ref), and the NIC's DMA (pinned by refcount). `_refcount` drops back to 1 (page cache only) after the NIC finishes.
+
+### What the tracer sees
+
+```
+I/O type          Tracer coverage
+─────────────────────────────────
+File read/write   Full (page cache → block I/O)
+Binder small txn  Full (alloc_pages + page_free fire)
+Binder large txn  None (DMA-buf pages bypass mm events)
+Network recv      Partial (page_pool: initial alloc visible, recycling invisible)
+Network send      Partial (sendfile: page cache pages visible)
+```
+
+Extending to networking requires hooking the page_pool API (tracepoints available in kernel 5.17+) and the sk_buff lifecycle — a different data source from page lifecycle events.
+
+---
+
+## Part 25: Filesystem Deep Dive — f2fs, ext4, erofs {#part-25-filesystem-deep-dive-f2fs-ext4-erofs}
+
+Part 10 covered the VFS abstraction. This part covers the three filesystems on Android in depth: how each translates file offsets to disk sectors, how each handles crash consistency, and how each interacts with the page cache and the tracer.
+
+### f2fs: Flash-Friendly File System
+
+f2fs (default `/data` on most Android devices since ~2015, merged kernel 3.8) is designed around NAND flash properties. Flash cannot overwrite in place — it must erase first (2–5ms per erase block). f2fs avoids in-place overwrites by appending to a log.
+
+**On-disk layout.** f2fs divides the partition into a superblock (4KB, written once at format), a checkpoint area (CP, two packs for crash consistency), a Segment Information Table (SIT, tracks valid blocks per segment), a Node Address Table (NAT, translates node IDs to physical addresses), and the main area (data and node blocks, organized into 2MB segments).
+
+**The SIT.** Each segment (512 blocks = 2MB) has a `struct f2fs_sit_entry` (at `include/linux/f2fs_fs.h:417`):
+
+```c
+struct f2fs_sit_entry {
+    __le16 vblocks;                          // count of valid blocks (0-512)
+    __u8   valid_map[SIT_VBLOCK_MAP_SIZE];   // bitmap: which blocks are valid
+    __le64 mtime;                            // segment age
+};
+```
+
+When f2fs overwrites a file block, the new version goes to a fresh location and the SIT marks the old location invalid. GC uses `vblocks` to find cheap victim segments — a segment with 5 valid blocks costs only 5 block copies to free 2MB.
+
+**The NAT: breaking the wandering tree.** In a naive log-structured FS, updating data block D forces updating its parent node (new address), which forces updating the grandparent, cascading to the root. f2fs breaks this cascade with the NAT: parent nodes store **node IDs** (stable 32-bit identifiers) instead of physical addresses. The NAT translates node IDs to current physical addresses. When a node moves, only its NAT entry changes — the parent node is unaffected.
+
+One data block update costs: 1 data write + 1 node write + 1 NAT entry update. Without NAT: 1 data + 1 node + 1 inode + 1 parent directory = 4 writes.
+
+**Multi-head logging.** f2fs maintains 6 open log segments simultaneously — hot/warm/cold for both data and nodes. Temperature separation reduces GC cost: a hot segment (all blocks rewritten frequently) frees itself entirely when all blocks become stale. A cold segment (rarely touched) is never GC'd. Mixing hot and cold in one segment forces GC to copy cold blocks every time it wants to free the hot blocks' space.
+
+**Checkpoint.** f2fs uses dual checkpoint packs instead of a journal. A checkpoint writes the complete filesystem state (SIT/NAT versions, segment summaries) to one of two CP packs, alternating. If power fails mid-write, the incomplete pack has mismatched header/footer versions and is discarded; the previous pack is still valid.
+
+For `fsync`, f2fs has a shortcut: write the file's dirty data blocks + the inode node (marked with `FSYNC_FLAG`) + a device flush. On recovery, f2fs scans for flagged nodes after the last CP and replays them. Cost: 1 data write + 1 node write + 1 flush — lighter than ext4's full journal transaction.
+
+**GC.** Victim selection uses cost-benefit analysis: `score = (1 - valid_ratio) × age / (2 × valid_ratio)`. Old, mostly-empty segments score highest. Background GC runs during idle periods. Foreground GC runs when free segments drop below a threshold and blocks the allocating thread.
+
+The **double-GC cascade**: when f2fs GC writes valid blocks to a new segment, the UFS FTL maps these to NAND pages. When the old segment is TRIMmed, the FTL marks old NAND pages stale. The FTL's own GC then fires, reading valid NAND pages from the old erase block and rewriting them. Both GC processes compete for NAND bandwidth. The tracer sees this as `EVT_IO_ISSUE → EVT_IO_COMPLETE` gaps 25–250× longer than normal.
+
+### ext4
+
+ext4 uses in-place overwrites with a write-ahead journal (jbd2). Before modifying filesystem structures, ext4 writes the planned modifications to a journal area. If power fails during the apply phase, the journal is replayed on mount.
+
+Three journaling modes: **journal** (data + metadata journaled, safest, slowest), **ordered** (default — metadata journaled, data forced to disk before metadata commit), **writeback** (metadata only, fastest, risk of stale data exposure after crash).
+
+**Extents.** `struct ext4_extent` (at `fs/ext4/ext4_extents.h:56`) maps contiguous file blocks to contiguous disk blocks. A contiguous 1GB file needs one 12-byte extent. The extent tree root fits in the inode's `i_block` field — files with ≤4 extents need no extra disk blocks for metadata.
+
+**Delayed allocation.** ext4 delays assigning physical disk blocks until writeback. 100 `write()` calls create 100 dirty pages with `DELAYED_ALLOCATION` markers. At writeback, ext4 allocates 100 contiguous blocks in one request — one extent instead of 100 scattered blocks. Reduces fragmentation and improves read performance.
+
+### erofs: Enhanced Read-Only File System
+
+Android's `/system`, `/vendor`, `/product` partitions never change at runtime. erofs (merged kernel 4.19, default on Android 12+) exploits this: no dirty pages, no writeback, no journal, no block allocation. The data is compressed at build time using LZ4 with large cluster sizes (64KB).
+
+**Cluster-based compression.** erofs compresses groups of 16 contiguous pages (64KB) together instead of individual 4KB pages. This yields much better compression ratios (~0.31 vs ~0.70 per-page) because the larger window captures more redundancy. Reading one page decompresses the entire cluster — the other 15 pages go into the page cache as free prefetching.
+
+A 5GB system image compresses to ~2.5GB on disk. Decompression at ~4GB/s LZ4 on a big core means effective read bandwidth from erofs exceeds raw UFS bandwidth.
+
+**Reclaim.** erofs pages are never dirty. Reclaim discards them without writeback — free. If needed again, the kernel reads the compressed cluster from disk and decompresses. The disk read is smaller than the decompressed data, so effective re-read bandwidth is higher than from an uncompressed filesystem.
+
+**Tracer behavior.** erofs pages are standard page cache pages. The tracer sees `EVT_ALLOC → EVT_CACHE_INSERT → EVT_READ → EVT_IO_ISSUE → EVT_IO_COMPLETE → EVT_READ_DONE → EVT_FAULT → EVT_FREE`. No `EVT_DIRTY`, no `EVT_WRITEBACK` — ever. The `nr_sectors` in I/O events reflects the compressed cluster size, not the decompressed size.
+
+### Android partition summary
+
+```
+Partition    Filesystem    R/W          Compressed    Content
+──────────────────────────────────────────────────────────────────
+/system      erofs         read-only    LZ4           OS, frameworks
+/vendor      erofs         read-only    LZ4           HAL libraries
+/product     erofs         read-only    LZ4           pre-installed apps
+/data        f2fs          read-write   no            app data, user files
+/metadata    ext4          read-write   no            encryption keys
+/cache       ext4          read-write   no            OTA staging
+```
+
+App launch touches all three: loading .so from `/system` (erofs, compressed read), loading DEX from `/data` (f2fs, cached), writing app storage on `/data` (f2fs, log-structured). The tracer's `s_dev` field in `EVT_CACHE_INSERT` identifies which partition backs each page.
 
 ---
 
