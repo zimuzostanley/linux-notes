@@ -5808,31 +5808,65 @@ App launch touches all three: loading .so from `/system` (erofs, compressed read
 
 From electromagnetic waves to HTTPS. Every layer explained by the problem it solves.
 
+### Radio physics: how information becomes electromagnetic waves
+
+An antenna is a piece of metal with electrons in it. Apply an oscillating voltage and the electrons wiggle back and forth. Wiggling electrons produce electromagnetic waves that travel outward at the speed of light. The wave has the same frequency as the electron oscillation — wiggle at 2.4 billion times per second and you emit a 2.4 GHz radio wave.
+
+**Wavelength** is the physical distance between consecutive peaks of the wave as it flies through space. Since the wave travels at the speed of light (300,000,000 m/s):
+
+```
+wavelength = speed of light / frequency
+
+Voice (1 kHz)       → 300 km
+AM radio (1 MHz)    → 300 m
+FM radio (100 MHz)  → 3 m
+WiFi (2.4 GHz)      → 12.5 cm
+5G mmWave (28 GHz)  → 1 cm
+```
+
+**Why antenna size matters.** An antenna radiates efficiently when its length is roughly half the wavelength. Electrons slosh from one end to the other in one half-cycle; this resonance maximizes energy transfer into the wave. A 2.4 GHz WiFi antenna is ~6 cm (half of 12.5 cm) — the stub inside your laptop. A 28 GHz 5G antenna is ~5 mm — small enough to fit dozens in a phone for beam-forming. A 1 kHz voice signal would need a 150 km antenna — obviously impossible.
+
+**Modulation: carrying information on a carrier.** A pure carrier wave — a perfect unchanging sine wave — carries zero information because nothing is changing. Information is encoded by deforming the carrier. In AM (Amplitude Modulation), the carrier's amplitude grows and shrinks in time with the voice signal. The carrier still oscillates at its original high frequency (radiating efficiently), but the size of the oscillation traces out the shape of the voice.
+
+The receiver tunes to the carrier frequency (filtering out all other stations), then traces the envelope of the oscillation to recover the original voice. Different stations pick different carrier frequencies and occupy non-overlapping bands — this is why hundreds of broadcasts coexist in the same air without scrambling each other.
+
+**QAM** (Quadrature Amplitude Modulation) extends this idea to digital data. Instead of varying just amplitude, vary both amplitude and phase simultaneously. Each combination maps to a point on a 2D grid; each point encodes a group of bits. 4-QAM: 4 points, 2 bits per symbol. 1024-QAM (WiFi 6): 1024 points (32×32 grid), 10 bits per symbol. More points = more bits = faster, but the points pack tighter, requiring a cleaner signal (**SNR** — Signal-to-Noise Ratio) to distinguish them. This is why WiFi is faster near the router (high SNR) and slower far away (low SNR, drops to fewer QAM points).
+
 ### The physical layer: moving bits
 
-A bit must travel from device A to device B. The medium determines how.
+Two devices need to exchange bits. The medium determines how.
 
-**Wires (Ethernet).** Twisted copper pairs carry differential voltage signals. The twisting causes external interference to affect both wires equally; the receiver subtracts, canceling the noise. Gigabit Ethernet uses 4 pairs at 250 Mbps each with PAM-5 encoding. Maximum cable length: 100 meters before signal attenuation makes the voltage levels indistinguishable.
+**Wires (Ethernet).** An Ethernet cable has 8 copper wires (4 twisted pairs). Each pair carries a differential voltage signal — one wire goes positive, its pair goes negative. The receiver measures the difference. Twisting causes external interference to affect both wires equally; subtraction cancels the noise (**differential signaling**). **PAM-5** (Pulse Amplitude Modulation, 5 levels) encodes ~2 bits per symbol (log₂(5) ≈ 2.3, minus error correction). 4 pairs × 250 Msymbols/sec × 2 bits = 1 Gbps. Maximum cable: 100 meters before attenuation.
 
-**Fiber optic.** Glass fiber carries pulses of light — laser on = 1, off = 0. No electromagnetic interference. Wavelength-division multiplexing (WDM) sends multiple colors of light through the same fiber simultaneously: 96 wavelengths × 100 Gbps = 9.6 Tbps through a single hair-thin fiber. This is how undersea cables carry intercontinental traffic.
+**Fiber optic.** Glass fiber carries pulses of light — laser on = 1, off = 0. Immune to electromagnetic interference. **WDM** (Wavelength-Division Multiplexing) sends multiple colors of light simultaneously: 96 wavelengths × 100 Gbps = 9.6 Tbps through a single hair-thin fiber. The "last mile" to your house may be copper (DSL — internet over phone wires; cable — internet over TV coax) or fiber (FTTH — Fiber To The Home).
 
-**WiFi.** Radio waves at 2.4 GHz (longer range, slower, crowded) or 5/6 GHz (shorter range, faster, less interference). The transmitter uses OFDM — divides the channel into hundreds of narrow sub-carriers, each carrying a few bits. WiFi 6 uses 1024-QAM, encoding 10 bits per symbol per sub-carrier.
+**WiFi.** Radio waves at 2.4 GHz (12.5 cm wavelength, penetrates walls, crowded — shared with Bluetooth and microwaves), 5 GHz (6 cm, blocked by walls, faster, 24 non-overlapping channels), or 6 GHz (WiFi 6E/7). Radio signals bounce off walls — reflected copies arrive slightly delayed, overlapping with the next symbol (**multipath interference**). **OFDM** (Orthogonal Frequency-Division Multiplexing) fixes this by splitting the channel into hundreds of narrow sub-carriers (WiFi 6: 256 in 20 MHz). Each sub-carrier is slow enough that multipath falls within one symbol duration and can be compensated. If some sub-carriers are jammed, data on the others gets through. Combined with 1024-QAM (10 bits/symbol), 160 MHz channels, and **MIMO** (Multiple-Input Multiple-Output — multiple antenna pairs carrying independent streams): 9.6 Gbps theoretical max.
 
-**Cellular.** Licensed spectrum (no interference from other devices). LTE: 700 MHz–2.6 GHz. 5G sub-6: up to 6 GHz. 5G mmWave: 24–40 GHz (extremely fast, blocked by walls). OFDMA lets one tower serve 100+ phones by assigning each a subset of sub-carriers during its time slot.
+**Cellular.** Licensed spectrum (no interference from other devices). LTE: 700 MHz–2.6 GHz. 5G sub-6: up to 6 GHz. 5G mmWave: 24–40 GHz (very fast, ~1 Gbps, blocked by walls). **OFDMA** assigns each phone a subset of sub-carriers during its time slot — one tower serves 100+ phones.
 
-The physical layer's contract: send a stream of bits from A to B, with some error rate. Bits may be corrupted, lost, or delayed. Higher layers fix these problems.
+The physical layer's contract: send bits from A to B with some error rate. Bits may be corrupted, lost, or delayed. Higher layers fix these.
 
 ### The data link layer: talking to neighbors
 
 Your phone and router are on the same WiFi network, along with your laptop, TV, and thermostat. The physical layer can send bits over the radio, but how does the router know which device a message is for?
 
-**MAC addresses.** Every network interface has a unique 48-bit hardware address (e.g., `A4:83:E7:12:34:56`). Each frame carries a destination and source MAC. Every device on the network sees every WiFi frame; each checks the destination MAC and ignores non-matching frames.
+**MAC addresses** (Media Access Control). Every network interface has a unique 48-bit address burned into hardware (e.g., `A4:83:E7:12:34:56`). Each frame carries destination and source MACs:
 
-**CRC.** A 32-bit checksum at the end of each frame detects corruption from noise. Mismatch = frame silently discarded. Higher layers handle retransmission.
+```
+WiFi/Ethernet frame:
+┌──────────────────┬──────────────────┬──────┬──────────────┬─────┐
+│ Dest MAC (6B)    │ Src MAC (6B)     │ Type │   Payload    │ CRC │
+│ 00:1A:2B:3C:4D:5E│ A4:83:E7:12:34:56│0x0800│ (IP packet)  │ 4B  │
+└──────────────────┴──────────────────┴──────┴──────────────┴─────┘
+```
 
-**WiFi medium access (CSMA/CA).** On shared radio, two devices transmitting simultaneously corrupt each other's signals. CSMA/CA: listen before transmitting; if the channel is busy, wait a random backoff time; after transmitting, wait for an ACK. Random backoff prevents synchronized collisions. On a busy network with 20 devices, collisions add 1–50ms of variable latency.
+Every device on WiFi sees every frame; each checks the destination MAC and ignores non-matches. The `Type` field identifies the payload: `0x0800` = IPv4, `0x0806` = ARP, `0x86DD` = IPv6.
 
-**Switches.** A box with many Ethernet ports. It learns which MAC is on which port by watching incoming frames, then forwards frames only to the correct port — not to all ports.
+**CRC** (Cyclic Redundancy Check). A 32-bit checksum at the end of each frame. Receiver recomputes and compares. Mismatch = frame silently discarded. No retry at this layer — TCP handles retransmission.
+
+**CSMA/CA** (Carrier Sense Multiple Access / Collision Avoidance). On WiFi, two devices transmitting simultaneously corrupt each other. Listen before transmitting; if busy, wait a random backoff; transmit; wait for ACK. No ACK = assume collision, double backoff, retry. On a busy network, collisions add 1–50ms of variable latency.
+
+**Switches.** A box with many Ethernet ports. Learns which MAC is on which port by watching incoming frames, then forwards only to the correct port — not all ports. Wired Ethernet through a switch has no collisions — each port has its own dedicated wire.
 
 ### IP: crossing networks
 
@@ -5854,11 +5888,21 @@ IP delivers packets with no guarantees — out of order, lost, duplicated. TCP p
 
 **Sequence numbers.** Every byte has a sequence number. The receiver ACKs by sending the next expected sequence number. If a packet is lost, the ACK doesn't advance — the sender detects this and retransmits.
 
-**Fast retransmit.** Three duplicate ACKs for the same sequence number trigger immediate retransmission, faster than waiting for the timeout (RTO, ~1 second initially).
+**Fast retransmit.** Three duplicate ACKs trigger immediate retransmission — faster than the **RTO** (Retransmission Timeout, dynamically computed from measured **RTT** — Round-Trip Time, typically 20–100ms on the internet):
 
-**Flow control.** The receiver advertises a window size in every ACK — how much buffer space it has. The sender cannot exceed this. Window = 0 means "stop sending, I'm full." This is the receive-side backpressure tied to `sk->sk_rcvbuf` in Part 24.
+```
+Sender sends segments 1, 2, 3, 4, 5. Segment 2 lost.
+Receiver gets 1: ACK 2001
+Receiver gets 3: ACK 2001 (duplicate — still waiting for 2001)
+Receiver gets 4: ACK 2001 (duplicate)
+Receiver gets 5: ACK 2001 (duplicate)
+Sender sees 3 duplicate ACKs → retransmit segment 2
+Receiver gets 2: ACK 7001 (got everything, jump ahead)
+```
 
-**Congestion control.** The sender maintains a congestion window (`cwnd`). Slow start doubles `cwnd` each RTT (exponential ramp). After a threshold, growth slows to linear. Packet loss = congestion signal: `cwnd` is halved. The saw-tooth pattern — ramp up, detect loss, cut back — continuously adapts to available bandwidth. Linux uses CUBIC by default; Google uses BBR.
+**Flow control.** The receiver advertises a window size in every ACK — available buffer space. Window = 0 means "stop sending." This is the backpressure tied to `sk->sk_rcvbuf` in Part 24.
+
+**Congestion control.** The sender maintains a congestion window (`cwnd`). **Slow start**: `cwnd` doubles each RTT (exponential growth). After **ssthresh** (slow start threshold), growth slows to linear. Packet loss = congestion signal: `cwnd` halved. This saw-tooth adapts to bandwidth. **CUBIC** (Linux default) uses a cubic function to recover faster after loss. **BBR** (Bottleneck Bandwidth and RTT, developed by Google) directly measures bandwidth and RTT instead of using loss as the signal — keeps the pipe full without filling router buffers.
 
 **Ports.** A connection is identified by `(src_ip, src_port, dst_ip, dst_port)`. Well-known ports: 80 (HTTP), 443 (HTTPS), 22 (SSH), 53 (DNS). Client ports are ephemeral (49152–65535).
 
@@ -5878,7 +5922,9 @@ DNS is a distributed hierarchical database. Resolution: phone asks resolver (e.g
 
 ### TLS: encryption
 
-TLS wraps TCP with confidentiality (encryption), integrity (tampering detection), and authentication (server proves identity via certificate). TLS 1.3 handshake completes in 1 RTT: client sends supported ciphers + ephemeral public key → server responds with chosen cipher + its public key + certificate → both compute a shared secret via Elliptic Curve Diffie-Hellman. All subsequent data is encrypted.
+**TLS** (Transport Layer Security) wraps TCP with confidentiality, integrity, and authentication. TLS 1.3 handshake (1 RTT):
+
+Client sends ClientHello: supported cipher suites (**AES-256-GCM** — AES = Advanced Encryption Standard, 256-bit key, GCM = Galois/Counter Mode for authenticated encryption, hardware-accelerated on modern CPUs; or **ChaCha20-Poly1305** — software-friendly, fast on phones without AES hardware) plus an ephemeral public key. Server responds with chosen cipher, its public key, and a certificate signed by a **CA** (Certificate Authority — a trusted company like DigiCert or Let's Encrypt; ~150 root CAs are pre-installed on every phone). Client verifies the certificate: trusted CA? Domain matches? Not expired? Both sides compute a shared secret via **ECDH** (Elliptic Curve Diffie-Hellman — the math is one-way; eavesdroppers who see both public keys cannot compute the secret). All subsequent data encrypted.
 
 ### HTTP: the application layer
 
@@ -5908,27 +5954,38 @@ A 100-byte HTTP request becomes ~189 bytes on the air. The 89 bytes of headers a
 
 ### Linux kernel implementation
 
-Sockets are file descriptors. `write(sock_fd, data, len)` → `tcp_sendmsg` → builds sk_buffs → TCP adds headers → IP routes → driver queues for NIC → NIC DMAs and transmits. `read(sock_fd, buf, len)` → `tcp_recvmsg` → copies from `sk_receive_queue` to userspace → frees sk_buffs.
+Sockets are file descriptors:
 
-The receive path: NIC DMAs into page_pool page → driver builds sk_buff → NAPI poll → GRO coalesces → IP validates → TCP sequences and ACKs → sk_buff queued on socket → `recv()` copies to userspace.
+```c
+int sock = socket(AF_INET, SOCK_STREAM, 0);  // AF_INET=IPv4, SOCK_STREAM=TCP
+connect(sock, &addr, sizeof(addr));
+write(sock, data, len);   // → tcp_sendmsg → sk_buffs → TCP → IP → NIC
+read(sock, buf, len);     // → tcp_recvmsg → copy from sk_receive_queue
+```
 
-The send path: userspace data → sk_buff pages → TCP headers → IP headers → link-layer headers → NIC DMA → transmit. sendfile uses page cache pages directly as sk_buff frags — zero-copy send.
+**The receive path.** NIC DMAs packet into page_pool page → raises interrupt → driver's IRQ handler disables further interrupts, schedules **NAPI** (New API). Without NAPI, each packet triggers a hardware interrupt (~5µs each). At 1M packets/sec, 100% CPU spent on interrupt handling. NAPI: first packet triggers one interrupt, then a poll function processes packets in a tight loop — no interrupt overhead — until the ring drains or a budget is hit (typically 64 packets). Then re-enable interrupts and wait.
+
+**GRO** (Generic Receive Offload) coalesces multiple TCP segments from the same flow: 10 × 1460-byte segments → one 14600-byte sk_buff. IP and TCP process this merged sk_buff once, not 10 times — 10× reduction in per-packet overhead.
+
+After GRO: IP validates headers → TCP checks sequence numbers, processes ACKs, updates receive window → sk_buff queued on `sk->sk_receive_queue` → `recv()` copies to userspace → sk_buff freed → page returned to page_pool.
+
+**The send path.** `write()` → `tcp_sendmsg` copies data into sk_buff pages → TCP adds headers (sequence number, checksum) → IP adds headers (src/dst, TTL) → `dev_queue_xmit` adds link-layer header → NIC DMAs from RAM and transmits → completion interrupt → sk_buff freed. `sendfile` uses page cache pages directly as sk_buff frags — zero-copy send (Part 24).
 
 Part 24 covers the page-level details: page_pool recycling, sk_buff frag references, and how `_refcount` prevents reclaim from evicting pages mid-DMA.
 
 ### WiFi specifics
 
-**Association:** scan for beacons → authenticate → associate → WPA2/3 four-way key exchange. All subsequent frames encrypted with AES.
+**Association.** Phone scans channels for Beacon frames (announcing the **SSID** — Service Set Identifier, the network name like "MyHomeWiFi"). Sends Association Request → **AP** (Access Point) responds → **WPA2/3** (WiFi Protected Access) four-way key exchange derives a per-session encryption key from the WiFi password. All subsequent frames encrypted with **AES** (Advanced Encryption Standard).
 
-**Power saving:** phone sleeps between DTIM intervals (~100ms). AP buffers packets. Adds ~100ms latency to the first packet after sleep. WiFi 6/7 Target Wake Time (TWT) reduces this.
+**Power saving.** WiFi radio: ~500mW active, ~10mW asleep. Phone tells the AP "I'm sleeping." AP buffers incoming packets. Every ~100ms, the AP sends a Beacon containing a **TIM** (Traffic Indication Map) — a bitmap with one bit per device. The phone wakes briefly at **DTIM** (Delivery TIM) intervals to check its bit. If set, sends a **PS-Poll** (Power Save Poll) to retrieve buffered data. If clear, sleeps immediately. Worst case: ~300ms latency to the first packet after sleep. WiFi 6/7 **TWT** (Target Wake Time) negotiates specific wake times, reducing both latency and power.
 
-**Roaming:** phone monitors signal strength → finds stronger AP with same SSID → reassociates. Transition: 50–500ms. TCP retransmission handles lost packets during roaming.
+**Roaming.** Phone monitors **RSSI** (Received Signal Strength Indicator): -30 dBm = excellent (next to router), -70 dBm = weak (through a wall), -80 dBm = edge of range. When RSSI drops below threshold, phone scans for a stronger AP with the same SSID, sends Reassociation Request. Transition: 50–500ms. IP address unchanged — only the link layer changed. TCP retransmission handles any lost packets.
 
 ### Cellular specifics
 
-**Connection:** modem scans frequencies → finds strongest tower → RRC setup → SIM authentication → gets IP address from carrier. Packets: phone → tower (radio) → carrier core (fiber) → internet.
+**Connection.** The cellular modem is a separate processor with its own radio. It connects to cell towers — each tower is an **eNodeB** (evolved Node B, the LTE base station). The tower broadcasts **SIBs** (System Information Blocks — the cellular equivalent of WiFi Beacons). The phone sends an **RRC** (Radio Resource Control) connection request → tower assigns a **C-RNTI** (Cell Radio Network Temporary Identifier, a 16-bit local ID) → SIM card authentication (both sides compute a challenge-response using a shared secret key) → carrier's **PGW** (Packet Data Network Gateway) assigns an IP address. Phone is online: phone ↔ tower (radio) ↔ carrier core (fiber) ↔ internet.
 
-**Handover:** as you drive, the network migrates you between towers. Source tower contacts target → reserves resources → tells phone to switch → phone tunes to new frequency → target starts forwarding. Interruption: 20–50ms on LTE, ~0ms on 5G. IP address preserved via GTP tunnels between core network nodes.
+**Handover.** Network-controlled (unlike WiFi where the phone decides). Phone reports signal measurements → source tower decides to hand off → contacts target via **X2** interface (direct fiber link between neighboring towers) → target reserves resources → source tells phone to switch frequency → phone tunes and sends Handover Complete → target starts serving. Interruption: 20–50ms on LTE, ~0ms on 5G (make-before-break: connects to new tower before disconnecting). IP address preserved via **GTP** (GPRS Tunneling Protocol) tunnels — the PGW's tunnel endpoint moves from source to target tower, but the phone's IP stays the same. From TCP's perspective, the 20–50ms pause looks like a momentary delay — retransmission handles it.
 
 ---
 
