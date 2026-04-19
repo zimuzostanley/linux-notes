@@ -74,7 +74,8 @@ Everything is licensed under the kernel's GPL-2.0 terms for the code that is quo
 23. [DMA-buf: How Pages Move Between Hardware](#part-23-dma-buf-how-pages-move-between-hardware)
 24. [Network Stack: How Pages Carry Packets](#part-24-network-stack-how-pages-carry-packets)
 25. [Filesystem Deep Dive: f2fs, ext4, erofs](#part-25-filesystem-deep-dive-f2fs-ext4-erofs)
-26. [Appendix A: Complete Source Reference](#appendix-a-complete-source-reference)
+26. [Networking From the Ground Up](#part-26-networking-from-the-ground-up)
+27. [Appendix A: Complete Source Reference](#appendix-a-complete-source-reference)
 
 ---
 
@@ -5800,6 +5801,134 @@ Partition    Filesystem    R/W          Compressed    Content
 ```
 
 App launch touches all three: loading .so from `/system` (erofs, compressed read), loading DEX from `/data` (f2fs, cached), writing app storage on `/data` (f2fs, log-structured). The tracer's `s_dev` field in `EVT_CACHE_INSERT` identifies which partition backs each page.
+
+---
+
+## Part 26: Networking From the Ground Up {#part-26-networking-from-the-ground-up}
+
+From electromagnetic waves to HTTPS. Every layer explained by the problem it solves.
+
+### The physical layer: moving bits
+
+A bit must travel from device A to device B. The medium determines how.
+
+**Wires (Ethernet).** Twisted copper pairs carry differential voltage signals. The twisting causes external interference to affect both wires equally; the receiver subtracts, canceling the noise. Gigabit Ethernet uses 4 pairs at 250 Mbps each with PAM-5 encoding. Maximum cable length: 100 meters before signal attenuation makes the voltage levels indistinguishable.
+
+**Fiber optic.** Glass fiber carries pulses of light — laser on = 1, off = 0. No electromagnetic interference. Wavelength-division multiplexing (WDM) sends multiple colors of light through the same fiber simultaneously: 96 wavelengths × 100 Gbps = 9.6 Tbps through a single hair-thin fiber. This is how undersea cables carry intercontinental traffic.
+
+**WiFi.** Radio waves at 2.4 GHz (longer range, slower, crowded) or 5/6 GHz (shorter range, faster, less interference). The transmitter uses OFDM — divides the channel into hundreds of narrow sub-carriers, each carrying a few bits. WiFi 6 uses 1024-QAM, encoding 10 bits per symbol per sub-carrier.
+
+**Cellular.** Licensed spectrum (no interference from other devices). LTE: 700 MHz–2.6 GHz. 5G sub-6: up to 6 GHz. 5G mmWave: 24–40 GHz (extremely fast, blocked by walls). OFDMA lets one tower serve 100+ phones by assigning each a subset of sub-carriers during its time slot.
+
+The physical layer's contract: send a stream of bits from A to B, with some error rate. Bits may be corrupted, lost, or delayed. Higher layers fix these problems.
+
+### The data link layer: talking to neighbors
+
+Your phone and router are on the same WiFi network, along with your laptop, TV, and thermostat. The physical layer can send bits over the radio, but how does the router know which device a message is for?
+
+**MAC addresses.** Every network interface has a unique 48-bit hardware address (e.g., `A4:83:E7:12:34:56`). Each frame carries a destination and source MAC. Every device on the network sees every WiFi frame; each checks the destination MAC and ignores non-matching frames.
+
+**CRC.** A 32-bit checksum at the end of each frame detects corruption from noise. Mismatch = frame silently discarded. Higher layers handle retransmission.
+
+**WiFi medium access (CSMA/CA).** On shared radio, two devices transmitting simultaneously corrupt each other's signals. CSMA/CA: listen before transmitting; if the channel is busy, wait a random backoff time; after transmitting, wait for an ACK. Random backoff prevents synchronized collisions. On a busy network with 20 devices, collisions add 1–50ms of variable latency.
+
+**Switches.** A box with many Ethernet ports. It learns which MAC is on which port by watching incoming frames, then forwards frames only to the correct port — not to all ports.
+
+### IP: crossing networks
+
+MAC addresses are local — they only work within your home network. To reach a server thousands of miles away, you need a global addressing scheme.
+
+**IP addresses.** IPv4: 32-bit addresses (e.g., `142.250.80.46`). ~4 billion addresses, not enough for every device — NAT solves this (below). IPv6: 128-bit addresses, enough for every atom on Earth.
+
+**Routing.** Your phone sends packets to its default gateway (the router). The router forwards to the ISP. Each router has a routing table mapping destination IP ranges to output interfaces. Packets hop router-to-router until reaching the destination's network. `traceroute` shows this path.
+
+**ARP.** Your phone knows the router's IP but needs its MAC to build the WiFi frame. ARP broadcasts "who has 192.168.1.1?" The router responds with its MAC. The mapping is cached. ARP is local-only — at each router hop, MAC addresses change but IP addresses stay the same end-to-end.
+
+**TTL.** Each router decrements the packet's Time To Live by 1. When it hits 0, the packet is discarded. Prevents infinite loops.
+
+### TCP: reliable delivery
+
+IP delivers packets with no guarantees — out of order, lost, duplicated. TCP provides reliable, ordered delivery over this unreliable substrate.
+
+**Three-way handshake.** SYN (my sequence number is X) → SYN-ACK (yours is Y, I got X) → ACK (I got Y). Both sides have synchronized state. One RTT before data flows.
+
+**Sequence numbers.** Every byte has a sequence number. The receiver ACKs by sending the next expected sequence number. If a packet is lost, the ACK doesn't advance — the sender detects this and retransmits.
+
+**Fast retransmit.** Three duplicate ACKs for the same sequence number trigger immediate retransmission, faster than waiting for the timeout (RTO, ~1 second initially).
+
+**Flow control.** The receiver advertises a window size in every ACK — how much buffer space it has. The sender cannot exceed this. Window = 0 means "stop sending, I'm full." This is the receive-side backpressure tied to `sk->sk_rcvbuf` in Part 24.
+
+**Congestion control.** The sender maintains a congestion window (`cwnd`). Slow start doubles `cwnd` each RTT (exponential ramp). After a threshold, growth slows to linear. Packet loss = congestion signal: `cwnd` is halved. The saw-tooth pattern — ramp up, detect loss, cut back — continuously adapts to available bandwidth. Linux uses CUBIC by default; Google uses BBR.
+
+**Ports.** A connection is identified by `(src_ip, src_port, dst_ip, dst_port)`. Well-known ports: 80 (HTTP), 443 (HTTPS), 22 (SSH), 53 (DNS). Client ports are ephemeral (49152–65535).
+
+### UDP: when reliability is wrong
+
+TCP's handshake adds 1 RTT of latency. Retransmission adds delay. In-order delivery causes head-of-line blocking — one lost packet stalls everything behind it. For live video, DNS lookups, and games, UDP is better: just port multiplexing and a checksum. Send a datagram; it either arrives or it doesn't. QUIC (HTTP/3) is built on UDP with its own reliability layer in userspace.
+
+### NAT: sharing one IP
+
+Your ISP gives you one public IP. Your router maintains a NAT table: internal `(private_ip, port)` ↔ external `(public_ip, translated_port)`. Outgoing packets get source-rewritten. Incoming responses get destination-rewritten using the table. External servers only see your public IP. Incoming unsolicited connections are blocked — no table entry exists.
+
+**DHCP.** When your phone joins WiFi, it broadcasts a DHCP Discover. The router responds with an IP, gateway, and DNS server. Four-packet exchange, all broadcast/unicast UDP.
+
+### DNS: names to addresses
+
+DNS is a distributed hierarchical database. Resolution: phone asks resolver (e.g., 8.8.8.8) → resolver asks root server ("where is .com?") → asks TLD server ("where is google.com?") → asks Google's nameserver ("what is www.google.com?") → returns the IP. Four round trips uncached (~80ms). Cached: ~1ms local, ~20ms resolver. Uses UDP port 53.
+
+### TLS: encryption
+
+TLS wraps TCP with confidentiality (encryption), integrity (tampering detection), and authentication (server proves identity via certificate). TLS 1.3 handshake completes in 1 RTT: client sends supported ciphers + ephemeral public key → server responds with chosen cipher + its public key + certificate → both compute a shared secret via Elliptic Curve Diffie-Hellman. All subsequent data is encrypted.
+
+### HTTP: the application layer
+
+With all layers in place, opening `https://www.google.com/search?q=hello`:
+
+```
+DNS resolve:  www.google.com → 142.250.80.46           (~20ms cached)
+TCP handshake to 142.250.80.46:443                       (~20ms = 1 RTT)
+TLS 1.3 handshake (overlaps)                             (~20ms = 1 RTT)
+HTTP request: GET /search?q=hello HTTP/2                 
+Server processes (query, build HTML)                     (~50ms)
+Response: 150KB HTML → ~103 TCP segments                 (multiple RTTs)
+Total: ~200-400ms for first meaningful paint
+```
+
+HTTP/2 multiplexes requests on one TCP connection — 50 resources requested simultaneously. HTTP/3 (QUIC) uses UDP, so a lost packet for one stream doesn't block others.
+
+### Encapsulation
+
+Each layer wraps the previous layer's data:
+
+```
+HTTP request → TLS record → TCP segment → IP packet → WiFi frame → radio waves
+```
+
+A 100-byte HTTP request becomes ~189 bytes on the air. The 89 bytes of headers are the cost of addressing, reliability, encryption, and physical delivery. At each router hop, the link-layer frame changes (new MACs) but IP and TCP headers stay the same end-to-end.
+
+### Linux kernel implementation
+
+Sockets are file descriptors. `write(sock_fd, data, len)` → `tcp_sendmsg` → builds sk_buffs → TCP adds headers → IP routes → driver queues for NIC → NIC DMAs and transmits. `read(sock_fd, buf, len)` → `tcp_recvmsg` → copies from `sk_receive_queue` to userspace → frees sk_buffs.
+
+The receive path: NIC DMAs into page_pool page → driver builds sk_buff → NAPI poll → GRO coalesces → IP validates → TCP sequences and ACKs → sk_buff queued on socket → `recv()` copies to userspace.
+
+The send path: userspace data → sk_buff pages → TCP headers → IP headers → link-layer headers → NIC DMA → transmit. sendfile uses page cache pages directly as sk_buff frags — zero-copy send.
+
+Part 24 covers the page-level details: page_pool recycling, sk_buff frag references, and how `_refcount` prevents reclaim from evicting pages mid-DMA.
+
+### WiFi specifics
+
+**Association:** scan for beacons → authenticate → associate → WPA2/3 four-way key exchange. All subsequent frames encrypted with AES.
+
+**Power saving:** phone sleeps between DTIM intervals (~100ms). AP buffers packets. Adds ~100ms latency to the first packet after sleep. WiFi 6/7 Target Wake Time (TWT) reduces this.
+
+**Roaming:** phone monitors signal strength → finds stronger AP with same SSID → reassociates. Transition: 50–500ms. TCP retransmission handles lost packets during roaming.
+
+### Cellular specifics
+
+**Connection:** modem scans frequencies → finds strongest tower → RRC setup → SIM authentication → gets IP address from carrier. Packets: phone → tower (radio) → carrier core (fiber) → internet.
+
+**Handover:** as you drive, the network migrates you between towers. Source tower contacts target → reserves resources → tells phone to switch → phone tunes to new frequency → target starts forwarding. Interruption: 20–50ms on LTE, ~0ms on 5G. IP address preserved via GTP tunnels between core network nodes.
 
 ---
 
