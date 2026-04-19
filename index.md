@@ -5810,9 +5810,11 @@ From electromagnetic waves to HTTPS. Every layer explained by the problem it sol
 
 ### Radio physics: how information becomes electromagnetic waves
 
-An antenna is a piece of metal with electrons in it. Apply an oscillating voltage and the electrons wiggle back and forth. Wiggling electrons produce electromagnetic waves that travel outward at the speed of light. The wave has the same frequency as the electron oscillation — wiggle at 2.4 billion times per second and you emit a 2.4 GHz radio wave.
+A signal is something that varies over time and carries information. Your voice is a signal — air pressure going up and down as your vocal cords vibrate, maybe 100–200 times per second. A microphone converts that pressure wiggle into voltage going up and down in the same pattern. Any wiggling thing has a **frequency** (how fast it wiggles, in Hertz), an **amplitude** (how big), and a **phase** (where in its cycle it is right now).
 
-**Wavelength** is the physical distance between consecutive peaks of the wave as it flies through space. Since the wave travels at the speed of light (300,000,000 m/s):
+An antenna is a piece of metal with electrons in it. Apply an oscillating voltage and the electrons wiggle back and forth. A changing electric current creates a changing magnetic field, which creates a changing electric field — the two leapfrog through space as an electromagnetic wave at the speed of light. The wave has the same frequency as the electron oscillation.
+
+**Wavelength** is the physical distance between consecutive peaks of the wave. A wave at 1 kHz completes 1,000 cycles per second while traveling 300,000,000 meters — each cycle is 300 km long. If you could freeze a radio wave and measure peak-to-peak with a ruler:
 
 ```
 wavelength = speed of light / frequency
@@ -5824,13 +5826,51 @@ WiFi (2.4 GHz)      → 12.5 cm
 5G mmWave (28 GHz)  → 1 cm
 ```
 
-**Why antenna size matters.** An antenna radiates efficiently when its length is roughly half the wavelength. Electrons slosh from one end to the other in one half-cycle; this resonance maximizes energy transfer into the wave. A 2.4 GHz WiFi antenna is ~6 cm (half of 12.5 cm) — the stub inside your laptop. A 28 GHz 5G antenna is ~5 mm — small enough to fit dozens in a phone for beam-forming. A 1 kHz voice signal would need a 150 km antenna — obviously impossible.
+**Why antenna size matters.** Think of pushing a kid on a swing. Push in rhythm with the swing's natural period, and each push adds energy — the swing goes higher. Push randomly, and your pushes fight each other — no energy transfers. An antenna is the same: electrons in a piece of metal have a natural sloshing frequency that depends on the metal's length. Drive them at that frequency and they resonate — big oscillations, efficient radiation. The resonant length is roughly half the wavelength: electrons slosh end-to-end in one half-cycle.
 
-**Modulation: carrying information on a carrier.** A pure carrier wave — a perfect unchanging sine wave — carries zero information because nothing is changing. Information is encoded by deforming the carrier. In AM (Amplitude Modulation), the carrier's amplitude grows and shrinks in time with the voice signal. The carrier still oscillates at its original high frequency (radiating efficiently), but the size of the oscillation traces out the shape of the voice.
+- 1 kHz voice: half-wavelength = 150 km. Impossible.
+- 100 MHz FM radio: 1.5 m. The whip antenna on a car.
+- 2.4 GHz WiFi: 6 cm. The stub inside your laptop.
+- 28 GHz 5G: 5 mm. Dozens fit in a phone for beam-forming.
 
-The receiver tunes to the carrier frequency (filtering out all other stations), then traces the envelope of the oscillation to recover the original voice. Different stations pick different carrier frequencies and occupy non-overlapping bands — this is why hundreds of broadcasts coexist in the same air without scrambling each other.
+This is the real reason low-frequency signals don't transmit wirelessly. Any buildable antenna is thousands of times too short to resonate at voice frequencies — 99.999% of the energy heats the wire instead of radiating.
 
-**QAM** (Quadrature Amplitude Modulation) extends this idea to digital data. Instead of varying just amplitude, vary both amplitude and phase simultaneously. Each combination maps to a point on a 2D grid; each point encodes a group of bits. 4-QAM: 4 points, 2 bits per symbol. 1024-QAM (WiFi 6): 1024 points (32×32 grid), 10 bits per symbol. More points = more bits = faster, but the points pack tighter, requiring a cleaner signal (**SNR** — Signal-to-Noise Ratio) to distinguish them. This is why WiFi is faster near the router (high SNR) and slower far away (low SNR, drops to fewer QAM points).
+### The problem that forces modulation
+
+If you connect a microphone directly to an antenna, nothing useful happens. Two problems: (1) voice frequencies (100 Hz–8 kHz) need impossibly large antennas, and (2) everyone's voice occupies the same frequency range — all signals collide.
+
+The solution: **modulation**. Generate a high-frequency sine wave (the **carrier**) that radiates efficiently, and deform it in time with your information. Different people get different carrier frequencies, so they don't collide.
+
+A carrier has three properties you can vary: amplitude (A), frequency (f), and phase (φ). Every modulation scheme wiggles one or more of these three knobs. The carrier is `A · cos(2π · f · t + φ)`.
+
+**AM** (Amplitude Modulation). Wiggle the carrier's amplitude in time with the voice. Loud moment → big carrier. Quiet moment → small carrier. The carrier frequency stays locked; only the envelope carries information. AM is cheap but sensitive to noise — lightning and motors cause amplitude spikes that become static.
+
+**FM** (Frequency Modulation). Keep amplitude constant, wiggle the frequency slightly around the carrier. At 100 MHz FM radio, the frequency wobbles between 99.9 and 100.1 MHz in time with the music. FM is resistant to noise because most noise corrupts amplitude, not frequency — an FM receiver ignores amplitude entirely (using a limiter circuit). This is why FM sounds like music and AM sounds like talk shows through a tin can. The tradeoff: FM uses more spectrum per station (200 kHz vs AM's 10 kHz).
+
+**PM** (Phase Modulation). Wiggle the phase — where in the cycle the wave is. Mathematically related to FM: FM of signal X equals PM of the integral of X. Both keep amplitude constant. PM is mainly a building block for digital schemes.
+
+The receiver tunes to the carrier frequency, filters out other stations, and undoes the deformation to recover the original information. This is why hundreds of broadcasts coexist — each lives in a narrow band around its own carrier frequency.
+
+### From analog to digital modulation
+
+Analog modulation wiggles the carrier's knobs continuously. Digital modulation picks discrete values:
+
+- **ASK** (Amplitude Shift Keying): big amplitude = 1, small = 0. Digital AM.
+- **FSK** (Frequency Shift Keying): one frequency = 1, another = 0. Digital FM. Old dial-up modems used FSK — the screeching was audible tones flipping between bit values.
+- **PSK** (Phase Shift Keying): 0° phase = 1, 180° = 0. Digital PM. QPSK uses 4 phases for 2 bits/symbol.
+- **PAM** (Pulse Amplitude Modulation): distinct pulse heights represent bit groups. Ethernet uses PAM-5 (5 levels, ~2 bits/symbol). PAM is mainly for wires, not radio.
+
+**QAM** (Quadrature Amplitude Modulation) wiggles amplitude AND phase simultaneously — each combination maps to a point on a 2D grid. 4-QAM: 4 points, 2 bits/symbol. 1024-QAM (WiFi 6): 1024 points (32×32 grid), 10 bits/symbol. 4096-QAM (WiFi 7): 12 bits/symbol. More points = more bits = faster, but packed tighter, requiring a cleaner signal (**SNR** — Signal-to-Noise Ratio). WiFi uses 1024-QAM near the router (high SNR) and drops to 16-QAM far away (low SNR).
+
+### Cellular generations
+
+Cellular evolution is the story of modulation and multiple-access getting better:
+
+- **1G** (1980s): Analog FM voice. One call per frequency. No data.
+- **2G/GSM** (1990s): Digital. GMSK modulation (a variant of FSK). **TDMA** — multiple users share one frequency by taking turns in time slots. SMS. Tens of kbps.
+- **3G/CDMA** (2000s): **CDMA** (Code Division Multiple Access) — everyone transmits simultaneously on the same frequency with unique mathematical codes. Qualcomm owned the foundational CDMA patents — every 3G phone paid them royalties.
+- **4G/LTE** (2010s): Switched to OFDM + QAM, scaling better than CDMA. Qualcomm's chipset and patent portfolio kept them dominant.
+- **5G** (2019+): Still OFDM + QAM, plus mmWave frequencies (24–40 GHz), massive MIMO (beamforming to individual users), low-latency modes.
 
 ### The physical layer: moving bits
 
@@ -5954,22 +5994,39 @@ A 100-byte HTTP request becomes ~189 bytes on the air. The 89 bytes of headers a
 
 ### Linux kernel implementation
 
-Sockets are file descriptors:
+Sockets are file descriptors. In the kernel, a socket is `struct socket` at `include/linux/net.h:116`, backed by `struct sock` at `include/net/sock.h:360`:
+
+```c
+struct socket {
+    struct file     *file;        // this IS a file — has an fd
+    struct sock     *sk;          // protocol state (TCP, UDP, etc.)
+    const struct proto_ops *ops;  // connect, sendmsg, recvmsg callbacks
+};
+
+struct sock {
+    struct sk_buff_head sk_receive_queue;  // received packets waiting for recv()
+    struct sk_buff_head sk_write_queue;    // data waiting to be sent
+    int             sk_rcvbuf;             // receive buffer limit
+    int             sk_sndbuf;             // send buffer limit
+};
+```
+
+Userspace:
 
 ```c
 int sock = socket(AF_INET, SOCK_STREAM, 0);  // AF_INET=IPv4, SOCK_STREAM=TCP
 connect(sock, &addr, sizeof(addr));
-write(sock, data, len);   // → tcp_sendmsg → sk_buffs → TCP → IP → NIC
-read(sock, buf, len);     // → tcp_recvmsg → copy from sk_receive_queue
+write(sock, data, len);   // → tcp_sendmsg at net/ipv4/tcp.c:1460
+read(sock, buf, len);     // → tcp_recvmsg at net/ipv4/tcp.c:2965
 ```
 
-**The receive path.** NIC DMAs packet into page_pool page → raises interrupt → driver's IRQ handler disables further interrupts, schedules **NAPI** (New API). Without NAPI, each packet triggers a hardware interrupt (~5µs each). At 1M packets/sec, 100% CPU spent on interrupt handling. NAPI: first packet triggers one interrupt, then a poll function processes packets in a tight loop — no interrupt overhead — until the ring drains or a budget is hit (typically 64 packets). Then re-enable interrupts and wait.
+**The receive path.** NIC DMAs packet into page_pool page → raises interrupt → driver's IRQ handler disables further interrupts, schedules **NAPI** (New API). Without NAPI, each packet triggers a hardware interrupt (~5µs each). At 1M packets/sec, 100% CPU spent on interrupt handling. NAPI: first packet triggers one interrupt, then a poll function processes packets in a tight loop — no interrupt overhead — until the ring drains or a budget is hit (typically 64 packets per poll). Then re-enable interrupts and wait.
 
-**GRO** (Generic Receive Offload) coalesces multiple TCP segments from the same flow: 10 × 1460-byte segments → one 14600-byte sk_buff. IP and TCP process this merged sk_buff once, not 10 times — 10× reduction in per-packet overhead.
+**GRO** (Generic Receive Offload) coalesces multiple TCP segments from the same flow: 10 × 1460-byte segments → one 14600-byte sk_buff. IP and TCP process this merged sk_buff once, not 10 times.
 
-After GRO: IP validates headers → TCP checks sequence numbers, processes ACKs, updates receive window → sk_buff queued on `sk->sk_receive_queue` → `recv()` copies to userspace → sk_buff freed → page returned to page_pool.
+After GRO: `ip_rcv` at `net/ipv4/ip_input.c:564` validates headers → `tcp_v4_rcv` at `net/ipv4/tcp_ipv4.c:2147` finds the matching `struct sock` via hash lookup on the 4-tuple → `tcp_rcv_established` (fast path) checks sequence numbers, processes ACKs, updates receive window → sk_buff queued on `sk->sk_receive_queue` → `recv()` calls `tcp_recvmsg` which copies to userspace → sk_buff freed → page returned to page_pool.
 
-**The send path.** `write()` → `tcp_sendmsg` copies data into sk_buff pages → TCP adds headers (sequence number, checksum) → IP adds headers (src/dst, TTL) → `dev_queue_xmit` adds link-layer header → NIC DMAs from RAM and transmits → completion interrupt → sk_buff freed. `sendfile` uses page cache pages directly as sk_buff frags — zero-copy send (Part 24).
+**The send path.** `write()` → `tcp_sendmsg` at `net/ipv4/tcp.c:1460` copies data into sk_buff pages → `tcp_write_xmit` adds TCP headers (sequence number, checksum) → `ip_queue_xmit` adds IP headers (src/dst, TTL) → `__dev_queue_xmit` at `net/core/dev.c:4760` adds link-layer header → NIC DMAs from RAM and transmits → completion interrupt → sk_buff freed. `sendfile` uses page cache pages directly as sk_buff frags — zero-copy send (Part 24).
 
 Part 24 covers the page-level details: page_pool recycling, sk_buff frag references, and how `_refcount` prevents reclaim from evicting pages mid-DMA.
 
