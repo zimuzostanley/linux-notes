@@ -35,11 +35,11 @@ Line numbers shift between releases — a function that is at `mm/memory.c:6589`
 
 The eBPF handlers here will compile, pass the verifier, and run on a real kernel. The userspace program handles filter configuration, lifecycle reconstruction, ring buffer draining, and graceful shutdown. Where something is simplified, I say so.
 
-**Prerequisites.** You should be comfortable in C and have mental models for processes, virtual memory, file descriptors, and system calls. You do not need prior kernel experience — Part 1 starts at the hardware (DRAM, caches, MMU). You do not need prior eBPF experience — Part 15 explains the entire eBPF architecture from instruction format up.
+**Prerequisites.** You should be comfortable in C and have mental models for processes, virtual memory, file descriptors, and system calls. You do not need prior kernel experience — Part 1 starts at the hardware (DRAM, caches, MMU). You do not need prior eBPF experience — Part 17 explains the entire eBPF architecture from instruction format up.
 
-**How to read.** Parts 1–3 cover the hardware: DRAM organization, the cache hierarchy, and page tables. Parts 4–6 cover the kernel data structures and tools. Parts 7–14 trace the mm subsystem in motion: faults, COW, writeback, block I/O, reclaim, zRAM, migration, synchronization. Part 15 introduces eBPF. Parts 16–17 build and operate the tracer. Part 18 covers Perfetto integration. Part 19 covers Android specifics. Part 20 gives historical context.
+**How to read.** Parts 1–3 cover the hardware: DRAM, the cache hierarchy, and page tables. Parts 4–6 cover the kernel data structures and tools. Parts 7–9 trace faults, COW, and writeback. Part 10 covers the VFS and filesystem layer. Part 11 covers block I/O. Parts 12–14 cover reclaim, zRAM, and page migration. Part 15 covers the scheduler and how it interacts with mm. Part 16 covers synchronization. Part 17 introduces eBPF. Parts 18–19 build and operate the tracer. Part 20 covers Perfetto integration. Part 21 covers Android specifics. Part 22 gives historical context. Appendix A has the complete tracer source.
 
-You can read linearly, or you can jump around. If you already know hardware and mm, skip to Part 15. If you already know eBPF, skip to Part 16. The cross-references tell you what earlier sections each later section depends on.
+You can read linearly, or you can jump around. If you already know hardware and mm, skip to Part 17. If you already know eBPF, skip to Part 18.
 
 **Reproducing the code.** All paths like `mm/memory.c:6589` refer to the kernel tree specified above. The BPF programs require a *running* kernel built with `CONFIG_DEBUG_INFO_BTF=y`, `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, and `CONFIG_BPF_EVENTS=y` — all enabled by default on modern distributions and on Android (GKI builds from Android 12 onward).
 
@@ -58,19 +58,19 @@ Everything is licensed under the kernel's GPL-2.0 terms for the code that is quo
 7. [The Page Fault: Where Everything Starts](#part-7-the-page-fault-where-everything-starts)
 8. [Anonymous Memory and Copy-on-Write](#part-8-anonymous-memory-and-copy-on-write)
 9. [Dirty Pages and Writeback: Getting Data to Disk](#part-9-dirty-pages-and-writeback-getting-data-to-disk)
-10. [The Block I/O Layer: From Pages to Sectors](#part-10-the-block-io-layer-from-pages-to-sectors)
-11. [Reclaim: How the Kernel Takes Memory Back](#part-11-reclaim-how-the-kernel-takes-memory-back)
-12. [zRAM: Android's Swap Trick](#part-12-zram-androids-swap-trick)
-13. [Page Migration: Moving Pages Without Anyone Noticing](#part-13-page-migration-moving-pages-without-anyone-noticing)
-14. [Synchronization: How the mm Subsystem Stays Sane](#part-14-synchronization-how-the-mm-subsystem-stays-sane)
-15. [eBPF: Observing the Kernel From the Inside](#part-15-ebpf-observing-the-kernel-from-the-inside)
-16. [Building a Page Lifecycle Tracer with eBPF](#part-16-building-a-page-lifecycle-tracer-with-ebpf)
-17. [Operating the Tracer: Build, Run, Debug, Tune](#part-17-operating-the-tracer-build-run-debug-tune)
-18. [Perfetto Integration](#part-18-perfetto-integration)
-19. [Android-Specific Considerations](#part-19-android-specific-considerations)
-20. [Historical Context: How We Got Here](#part-20-historical-context-how-we-got-here)
-21. [The Linux Scheduler](#part-21-the-linux-scheduler)
-22. [The VFS and Filesystem Layer](#part-22-the-vfs-and-filesystem-layer)
+10. [The VFS and Filesystem Layer](#part-10-the-vfs-and-filesystem-layer)
+11. [The Block I/O Layer: From Pages to Sectors](#part-11-the-block-io-layer-from-pages-to-sectors)
+12. [Reclaim: How the Kernel Takes Memory Back](#part-12-reclaim-how-the-kernel-takes-memory-back)
+13. [zRAM: Android's Swap Trick](#part-13-zram-androids-swap-trick)
+14. [Page Migration: Moving Pages Without Anyone Noticing](#part-14-page-migration-moving-pages-without-anyone-noticing)
+15. [The Linux Scheduler](#part-15-the-linux-scheduler)
+16. [Synchronization: How the mm Subsystem Stays Sane](#part-16-synchronization-how-the-mm-subsystem-stays-sane)
+17. [eBPF: Observing the Kernel From the Inside](#part-17-ebpf-observing-the-kernel-from-the-inside)
+18. [Building a Page Lifecycle Tracer with eBPF](#part-18-building-a-page-lifecycle-tracer-with-ebpf)
+19. [Operating the Tracer: Build, Run, Debug, Tune](#part-19-operating-the-tracer-build-run-debug-tune)
+20. [Perfetto Integration](#part-20-perfetto-integration)
+21. [Android-Specific Considerations](#part-21-android-specific-considerations)
+22. [Historical Context: How We Got Here](#part-22-historical-context-how-we-got-here)
 23. [Appendix A: Complete Source Reference](#appendix-a-complete-source-reference)
 
 ---
@@ -589,7 +589,7 @@ Question 3: "Which PTEs point to PFN 5000?"
   → reverse mapping (i_mmap for files, anon_vma for anonymous)
 ```
 
-These three questions drive page faults, reclaim, writeback, migration, and COW. The structures that answer them form the backbone of the mm subsystem. The tracer we build in Part 16 reaches into almost every one of these structures, and getting them wrong produces subtly broken tracers.
+These three questions drive page faults, reclaim, writeback, migration, and COW. The structures that answer them form the backbone of the mm subsystem. The tracer we build in Part 18 reaches into almost every one of these structures, and getting them wrong produces subtly broken tracers.
 
 ### 4.1 task_struct → mm_struct
 
@@ -694,7 +694,7 @@ VMAs are stored in `mm_mt` (the maple tree described in 4.1) for O(log n) lookup
 - Page faults take `mmap_lock` for read (shared — concurrent faults on different VMAs proceed in parallel).
 - `mmap`/`munmap`/`mprotect` take it for write (exclusive — blocks all faults during the modification).
 
-Newer kernels add **per-VMA locks** for better scalability: a fault only needs to lock the specific VMA it's touching, so faults on different VMAs never serialize. We come back to this in Part 14.
+Newer kernels add **per-VMA locks** for better scalability: a fault only needs to lock the specific VMA it's touching, so faults on different VMAs never serialize. We come back to this in Part 16.
 
 **VMA manipulation primitives:**
 
@@ -1022,7 +1022,7 @@ Then for each process, walk that process's page table (`vma->vm_mm->pgd`) to fin
 
 The question is a **range containment query**: "which VMAs contain page 130?" A VMA mapping pages 0–255 contains page 130, but you would never find it by hashing the number 130 or doing an exact-match lookup. A hash table finds exact keys; a linked list requires scanning every entry. An interval rbtree answers range containment in O(log n + k) where k is the number of matches — the tree can skip entire subtrees whose intervals do not contain the target.
 
-**Why this matters for reclaim.** Before the kernel can free a file-backed page, it must clear every PTE that points to it. Without `i_mmap`, finding those PTEs would require scanning every process's page tables — impractical. With `i_mmap`, the kernel walks a small set of VMAs and for each one clears exactly one PTE. This is what `try_to_unmap` does in the reclaim path (Part 11).
+**Why this matters for reclaim.** Before the kernel can free a file-backed page, it must clear every PTE that points to it. Without `i_mmap`, finding those PTEs would require scanning every process's page tables — impractical. With `i_mmap`, the kernel walks a small set of VMAs and for each one clears exactly one PTE. This is what `try_to_unmap` does in the reclaim path (Part 12).
 
 ### 4.12 Anonymous Reverse Mapping (anon_vma)
 
@@ -1107,7 +1107,7 @@ Multiple `bio` structs can be merged into a single `request` by the block layer'
 
 ### 4.14 How Everything Connects
 
-Here is the graph of pointers that tie these structures together. The tracer in Part 16 traverses this graph constantly, so it is worth burning into memory:
+Here is the graph of pointers that tie these structures together. The tracer in Part 18 traverses this graph constantly, so it is worth burning into memory:
 
 ```
 Finding the folio from the file:
@@ -1126,7 +1126,7 @@ Finding all processes mapping a folio:
 
 Every arrow is bidirectional. This connectivity is what makes reclaim, migration, COW, and sharing possible. Lose any one of these pointers and the whole system breaks: without `i_mmap`, reclaim cannot unmap file pages; without `anon_vma`, it cannot unmap anonymous pages; without `mapping` on the folio, it cannot find the owning file to remove the page cache entry; without `_mapcount`, COW cannot decide whether to reuse or copy.
 
-Every one of these pointers is updated atomically with respect to the others, using a combination of spinlocks (for fast-path updates like PTE installation), RCU (for readers walking the trees), and RW semaphores (for long-duration operations like mmap). Part 14 dissects the locking discipline.
+Every one of these pointers is updated atomically with respect to the others, using a combination of spinlocks (for fast-path updates like PTE installation), RCU (for readers walking the trees), and RW semaphores (for long-duration operations like mmap). Part 16 dissects the locking discipline.
 
 ### 4.15 Key Identity Relationships Summary
 
@@ -1892,7 +1892,122 @@ The `folio_wake_bit` call is important — other parts of the kernel (like `fsyn
 
 ---
 
-## Part 10: The Block I/O Layer — From Pages to Sectors {#part-10-the-block-io-layer-from-pages-to-sectors}
+## Part 10: The VFS and Filesystem Layer {#part-10-the-vfs-and-filesystem-layer}
+
+Between "look up page in page cache" and "submit bio to block layer," there is a layer the mm chapters cover quickly: the filesystem. This is where file offsets become disk sectors, where metadata is managed, and where the filesystem's on-disk layout affects I/O patterns.
+
+```
+Userspace:     read(fd, buf, 4096)
+VFS:           vfs_read → generic_file_read_iter
+Page cache:    filemap_read → filemap_get_pages
+               "is page N of this file in RAM?"
+                    │ (cache miss)
+Filesystem:    a_ops->readahead → ext4_readahead / f2fs_readahead
+               "page N of this file is at disk sector S"
+                    │
+Block layer:   submit_bio → blk_mq → driver → hardware
+```
+
+### The VFS abstraction
+
+The Virtual File System dispatches to filesystem-specific implementations via function pointers. The kernel never calls ext4 or f2fs directly.
+
+```c
+struct inode {
+    umode_t              i_mode;
+    unsigned long        i_ino;
+    loff_t               i_size;
+    struct super_block  *i_sb;
+    struct address_space i_data;     // page cache (embedded, not a pointer)
+    struct inode_operations *i_op;   // lookup, create, link
+    struct file_operations  *i_fop;  // read, write, mmap
+};
+```
+
+The `address_space` (Part 4.10) is embedded directly inside `struct inode` as `i_data`. One inode, one page cache.
+
+### File offset → disk sector translation
+
+This is the filesystem's core job for I/O. Given a file and a page offset, where on disk are those bytes?
+
+**ext4: extent tree.** An extent says "file bytes [start, start+len) are stored at disk block B." When the page cache needs page 130, `ext4_map_blocks` walks the extent tree in the inode to find the physical block number, then converts to a sector number for the bio.
+
+**f2fs (default on Android).** Log-structured design optimized for flash. Data blocks and node blocks (metadata) are separate. f2fs writes new data sequentially to clean segments, never overwriting in place. This aligns with flash hardware, which cannot overwrite — it must erase first. The translation goes through a node block that maps file offsets to physical data block addresses.
+
+f2fs has its own garbage collection (GC) thread that reads live blocks from old segments and rewrites them to new segments. This is f2fs-level GC on top of the FTL's own GC. Both compete for flash bandwidth — double GC is a real performance problem on Android.
+
+### address_space_operations
+
+The page cache calls the filesystem through these callbacks:
+
+```c
+struct address_space_operations {
+    int (*writepages)(struct address_space *, struct writeback_control *);
+    int (*readahead)(struct readahead_control *);
+    bool (*dirty_folio)(struct address_space *, struct folio *);
+    int (*write_begin)(struct file *, struct address_space *, loff_t,
+                       unsigned, struct folio **, void **);
+    int (*write_end)(struct file *, struct address_space *, loff_t,
+                     unsigned, unsigned, struct folio *, void *);
+};
+```
+
+**readahead** is called by the readahead engine (Part 11). The filesystem translates file offsets to disk sectors, builds bios, and submits them. **writepages** is called by writeback (Part 9) — same translation, opposite direction. **dirty_folio** tags the page in the xarray and marks the inode dirty. **write_begin/write_end** handle the `write()` syscall path — `write_begin` allocates disk blocks if the file is growing, `write_end` marks the page dirty.
+
+### The fsync path
+
+`fsync(fd)` guarantees data and metadata are on stable storage when it returns:
+
+```
+fsync(fd)
+  → file->f_op->fsync → ext4_sync_file
+    → filemap_write_and_wait_range   (write dirty pages, wait for I/O)
+    → jbd2_complete_transaction      (wait for journal commit)
+    → return 0 or -EIO
+```
+
+The `filemap_write_and_wait_range` call is what the tracer captures — EVT_WRITEBACK, EVT_IO_ISSUE, EVT_IO_COMPLETE, EVT_WB_DONE for each dirty page. The journal commit (step 2) is additional metadata I/O that the page tracer does not capture. To trace full fsync latency, hook `ext4_sync_file` or `f2fs_sync_file` directly.
+
+### Direct I/O
+
+`O_DIRECT` bypasses the page cache entirely. Reads and writes go from userspace buffers straight to bios and disk. The tracer will not see direct I/O through page lifecycle events — no EVT_ALLOC, no EVT_CACHE_INSERT. To trace direct I/O, hook `__blockdev_direct_IO` or the iomap direct I/O path.
+
+### The dentry cache and inode cache
+
+Two caches above the page cache:
+
+**Dentry cache (dcache).** Maps (parent dentry, name) → child dentry. Hit rate is typically >99%. Avoids reading directory blocks from disk for every `open()`.
+
+**Inode cache.** Every inode read from disk is cached in `inode_cache` slab. The cached inode contains the file's metadata and the `address_space` (page cache). Evicting an inode from the cache also evicts its page cache pages — the tracer sees a burst of EVT_CACHE_REMOVE events when the inode shrinker runs.
+
+Both caches are reclaimable. `echo 2 > /proc/sys/vm/drop_caches` shrinks both. Shrinking the dcache forces future path lookups to go to disk; shrinking the inode cache forces re-reading metadata and re-populating the page cache.
+
+### Where the tracer hooks into the filesystem
+
+The page lifecycle tracer captures the filesystem's interaction implicitly:
+
+```
+Filesystem call          Tracer event           How
+──────────────────────────────────────────────────────────────
+a_ops->readahead         EVT_ALLOC              page allocated for readahead
+  → filemap_add_folio    EVT_CACHE_INSERT       page enters cache
+  → bio_add_folio        EVT_READ               bio built with page + sector
+  → submit_bio           EVT_IO_ISSUE           dispatched to hardware
+  → folio_end_read       EVT_READ_DONE          data arrived
+
+a_ops->writepages        EVT_WRITEBACK          bio built for dirty page
+  → submit_bio           EVT_IO_ISSUE
+  → folio_end_writeback  EVT_WB_DONE
+
+a_ops->dirty_folio       EVT_DIRTY              page marked dirty
+```
+
+To trace filesystem-specific operations (journal commits, f2fs GC, extent allocation), add kprobes on fs-specific functions. These would be additional events, separate from the page lifecycle but correlatable by timestamp and tgid.
+
+---
+
+
+## Part 11: The Block I/O Layer — From Pages to Sectors {#part-11-the-block-io-layer-from-pages-to-sectors}
 
 The block layer sits between the filesystem and the disk driver. Its job is to take `bio` structs from the filesystem and deliver them to the hardware efficiently. This section traces the full read and write paths from userspace syscalls down to hardware and back, because you cannot build a useful tracer without understanding both directions.
 
@@ -2304,11 +2419,11 @@ trace_block_rq_issue(rq);
 trace_block_rq_complete(req, BLK_STS_OK, total_bytes);
 ```
 
-The challenge for our tracer: both tracepoints carry sector information (dev, sector, nr_sectors) but not PFN. To connect an I/O event back to a page, we need to record the (dev, sector) → page_id mapping *at bio construction time* (when we still have the folio). Part 16 shows exactly how.
+The challenge for our tracer: both tracepoints carry sector information (dev, sector, nr_sectors) but not PFN. To connect an I/O event back to a page, we need to record the (dev, sector) → page_id mapping *at bio construction time* (when we still have the folio). Part 18 shows exactly how.
 
 ---
 
-## Part 11: Reclaim — How the Kernel Takes Memory Back {#part-11-reclaim-how-the-kernel-takes-memory-back}
+## Part 12: Reclaim — How the Kernel Takes Memory Back {#part-12-reclaim-how-the-kernel-takes-memory-back}
 
 When the system is running low on free memory, the kernel needs to reclaim pages. It does this through a background daemon called `kswapd` (one per NUMA node) and through **direct reclaim** in the allocation path when `kswapd` cannot keep up.
 
@@ -2491,7 +2606,7 @@ trace_mm_page_free(page, order);
 
 ---
 
-## Part 12: zRAM — Android's Swap Trick {#part-12-zram-androids-swap-trick}
+## Part 13: zRAM — Android's Swap Trick {#part-13-zram-androids-swap-trick}
 
 Traditional desktop Linux uses swap partitions — when anonymous pages are evicted, they are written to a dedicated area on disk. Android does not do this. Writing to flash storage is slow (relative to RAM), wears out the flash, and modern phones have plenty of RAM to compress into.
 
@@ -2626,7 +2741,7 @@ For Android, this is generally disabled (flash wear) but available on servers.
 
 ### Why zRAM is hard to trace precisely
 
-For the tracer in Part 16, zRAM is the hardest subsystem to instrument per-page. The flow is:
+For the tracer in Part 18, zRAM is the hardest subsystem to instrument per-page. The flow is:
 
 ```
 anonymous page (PFN=X) → reclaim → swap_writeout → zram_bvec_write
@@ -2635,11 +2750,11 @@ anonymous page (PFN=X) → reclaim → swap_writeout → zram_bvec_write
 
 After compression, the original PFN is freed. The logical page exists as `(swap_entry, handle H, size S)`. When swap-in happens, a *new* PFN is allocated and `zcomp_decompress` fills it. The old PFN and new PFN have no direct relationship — they are connected only through the swap entry.
 
-So the tracer can observe "page PFN=X was handed to zRAM" (via a `zram_write_page` kprobe) and separately "page PFN=Y came from zRAM" (via a decompression kprobe), but linking them requires tracking the swap entry through the `struct folio`'s `->swap` field during the zram trip. Part 16 discusses this limitation.
+So the tracer can observe "page PFN=X was handed to zRAM" (via a `zram_write_page` kprobe) and separately "page PFN=Y came from zRAM" (via a decompression kprobe), but linking them requires tracking the swap entry through the `struct folio`'s `->swap` field during the zram trip. Part 18 discusses this limitation.
 
 ---
 
-## Part 13: Page Migration — Moving Pages Without Anyone Noticing {#part-13-page-migration-moving-pages-without-anyone-noticing}
+## Part 14: Page Migration — Moving Pages Without Anyone Noticing {#part-14-page-migration-moving-pages-without-anyone-noticing}
 
 Sometimes the kernel must physically relocate a page — copy 4096 bytes from one PFN to another — without any process noticing. Three scenarios:
 
@@ -2753,7 +2868,7 @@ The `remove_migration_ptes` call is the tricky part. During migration:
 
 If a process tries to access the page during step 2, it faults. The fault handler sees the migration entry, sleeps until migration completes, then retries. The process never knows its page moved — it just experiences a brief stall.
 
-**Why migration matters for tracing.** If you are tracking pages by PFN, migration breaks your tracking. The PFN changes, but it is logically the same page with the same data and the same owner. Any tracer that uses PFN as a key needs to handle migration or it will lose pages. This is one of the harder problems in building a page lifecycle tracer, and we address it in Part 16.
+**Why migration matters for tracing.** If you are tracking pages by PFN, migration breaks your tracking. The PFN changes, but it is logically the same page with the same data and the same owner. Any tracer that uses PFN as a key needs to handle migration or it will lose pages. This is one of the harder problems in building a page lifecycle tracer, and we address it in Part 18.
 
 ### Migration entries: the bridge state
 
@@ -2812,7 +2927,106 @@ The batch design exists because the per-folio work has fixed overhead (lock acqu
 
 ---
 
-## Part 14: Synchronization — How the mm Subsystem Stays Sane {#part-14-synchronization-how-the-mm-subsystem-stays-sane}
+## Part 15: The Linux Scheduler {#part-15-the-linux-scheduler}
+
+The scheduler answers one question: which thread runs next on this CPU? The kernel has hundreds or thousands of runnable threads and maybe 4–8 CPU cores. The scheduler picks one thread per core, lets it run for a while, then picks another.
+
+The scheduler runs in two situations. First, **voluntarily**: a thread calls `schedule()` because it is about to sleep — waiting for I/O, a lock, a futex, a timer. The scheduler picks the next thread from the runqueue. Second, **involuntarily (preemption)**: a thread's time slice expires, or a higher-priority thread wakes up. The scheduler sets `TIF_NEED_RESCHED` on the running thread. At the next preemption point (return from syscall, return from interrupt, explicit `cond_resched()`), the kernel calls `schedule()`.
+
+Context switching means saving the current thread's register state (stack pointer, program counter, callee-saved registers) and restoring the next thread's. On ARM64 this is `__switch_to` — about 20 instructions. The expensive part is not the register swap but the cache and TLB pollution: the new thread's working set is cold.
+
+### Scheduling classes
+
+The kernel has a hierarchy of scheduling classes, checked in priority order:
+
+```
+stop_sched_class       → migration threads (highest, internal only)
+dl_sched_class         → SCHED_DEADLINE (earliest deadline first)
+rt_sched_class         → SCHED_FIFO, SCHED_RR (fixed priority, real-time)
+fair_sched_class       → SCHED_NORMAL, SCHED_BATCH (CFS/EEVDF, the default)
+idle_sched_class       → SCHED_IDLE (lowest, runs when nothing else can)
+```
+
+The scheduler checks each class in order. If the RT class has a runnable thread, it runs before any CFS thread, unconditionally. A SCHED_DEADLINE thread runs before any RT thread. This ordering is absolute — a nice -20 CFS thread will never preempt a nice +19 RT thread.
+
+On Android, most app threads are SCHED_NORMAL (CFS). Audio threads are SCHED_FIFO (RT). The display compositor (SurfaceFlinger) runs at RT priority.
+
+### CFS and vruntime
+
+CFS (Completely Fair Scheduler, merged in 2.6.23) tracks how much CPU time each thread has received and always runs the thread that has received the least. Every CFS thread has a `vruntime` field in its `struct sched_entity`:
+
+```c
+struct sched_entity {
+    struct load_weight  load;       // weight derived from nice
+    struct rb_node      run_node;   // position in the rbtree
+    u64                 vruntime;   // virtual runtime in nanoseconds
+    u64                 sum_exec_runtime;
+};
+```
+
+`vruntime` is wall-clock time scaled by the thread's weight. A thread with twice the weight accumulates vruntime at half the rate — it can run twice as long before its vruntime catches up. The scheduler always picks the thread with the smallest vruntime.
+
+When a thread runs for `delta_exec` nanoseconds:
+
+```c
+vruntime += delta_exec * NICE_0_LOAD / weight;
+```
+
+`NICE_0_LOAD` is 1024. A nice -5 thread (weight 3121) advances vruntime at 1024/3121 ≈ 0.33× — it gets ~3× more CPU than a nice-0 thread. A nice +5 thread (weight 335) advances at 1024/335 ≈ 3×, getting ~1/3 the CPU.
+
+The nice-to-weight table is at `kernel/sched/core.c`:
+
+```c
+static const int sched_prio_to_weight[40] = {
+ /* -20 */ 88761, 71755, 56483, 46273, 36291,
+ /* -15 */ 29154, 23254, 18705, 14949, 11916,
+ /* -10 */  9548,  7620,  6100,  4904,  3906,
+ /*  -5 */  3121,  2501,  1991,  1586,  1277,
+ /*   0 */  1024,   820,   655,   526,   423,
+ /*   5 */   335,   272,   215,   172,   137,
+ /*  10 */   110,    87,    70,    56,    45,
+ /*  15 */    36,    29,    23,    18,    15,
+};
+```
+
+Each nice level changes weight by ~25%. Android sets foreground threads to nice -10 (weight 9548) and background to nice +10 (weight 110) — a ratio of ~87×.
+
+Kernel 6.6 replaced classic CFS with **EEVDF** (Earliest Eligible Virtual Deadline First). The rbtree is now sorted by virtual deadline rather than raw vruntime. EEVDF assigns each thread a virtual deadline = vruntime + (time slice / weight). The data structure is still an rbtree; the comparison key changed.
+
+### RT scheduling
+
+RT threads have fixed priorities from 1 to 99. Every RT thread runs before any CFS thread. Within RT, **SCHED_FIFO** threads run until they yield or block — no time slicing. **SCHED_RR** adds time slicing among same-priority threads (default 100ms quantum).
+
+The RT runqueue is a bitmap + per-priority linked list. `pick_next_task_rt` finds the highest set bit (one instruction) and takes the first entry. O(1).
+
+**Priority inversion.** High-priority thread H blocks on a mutex held by low-priority thread L. Medium-priority thread M preempts L. H starves. **Priority inheritance (PI) mutexes** fix this: when H blocks on a PI mutex held by L, the kernel boosts L to H's priority. On Android, Binder transactions use PI-aware mutexes for the audio and display paths.
+
+**RT throttling.** `/proc/sys/kernel/sched_rt_runtime_us` (default 950000) limits RT threads to 950ms per 1s per CPU. The remaining 50ms is guaranteed for CFS threads so you can ssh in and kill a runaway RT process.
+
+### SCHED_DEADLINE
+
+EDF (Earliest Deadline First) scheduling. Each thread declares runtime, deadline, and period. The scheduler guarantees completion before the deadline if CPU capacity permits. SCHED_DEADLINE threads preempt RT threads. A natural fit for display rendering (16ms deadline per frame) and audio (10ms per buffer).
+
+### sched_ext: BPF-based scheduling
+
+Merged in kernel 6.12. `sched_ext` lets you write a scheduler in BPF. The kernel provides callbacks (`select_cpu`, `enqueue`, `dequeue`, `dispatch`). You implement them in BPF, load them, and they replace CFS for `SCHED_EXT` threads. If your BPF scheduler crashes, the kernel falls back to CFS.
+
+Why this matters for mm: a BPF scheduler can access `task_struct→mm→rss_stat` and deprioritize threads whose working set is being reclaimed (they will just fault and stall anyway) or boost threads whose I/O just completed (their pages are hot).
+
+### How the scheduler connects to mm
+
+**Page fault.** A major fault calls `folio_wait_locked` → `schedule()` → thread sleeps until I/O completes. The scheduler picks another thread. When the I/O completes, the faulting thread is re-enqueued. Its vruntime has not advanced during sleep, so it runs promptly.
+
+**Direct reclaim.** When `alloc_pages` cannot find free memory, the allocating thread enters direct reclaim — it does kswapd's work itself. The thread is still on-CPU (not sleeping), doing reclaim work instead of application work. This can take milliseconds. Direct reclaim is the single biggest source of unpredictable latency in Linux.
+
+**kswapd.** Background reclaim daemon at nice -5 (weight 3121). Competes with normal threads via CFS. At nice -5 it gets ~3× more CPU than a nice-0 thread, but a CPU-bound app can slow kswapd, causing more direct reclaim.
+
+**Futex / mutex.** When a thread blocks on a futex, it calls `schedule()`. When the holder unlocks, `futex_wake` wakes the blocked thread. If the blocked thread has a smaller vruntime, it may preempt the unlocking thread immediately.
+
+---
+
+
+## Part 16: Synchronization — How the mm Subsystem Stays Sane {#part-16-synchronization-how-the-mm-subsystem-stays-sane}
 
 Multiple CPUs can fault on the same page simultaneously. Reclaim can try to evict a page while a process is mapping it. Writeback can be writing a page while the process is dirtying it again. The mm subsystem uses a layered locking strategy to handle all of this.
 
@@ -3008,7 +3222,7 @@ The BPF ring buffer (`kernel/bpf/ringbuf.c:463`) uses exactly this pattern: `smp
 
 ---
 
-## Part 15: eBPF — Observing the Kernel From the Inside {#part-15-ebpf-observing-the-kernel-from-the-inside}
+## Part 17: eBPF — Observing the Kernel From the Inside {#part-17-ebpf-observing-the-kernel-from-the-inside}
 
 eBPF lets you run small programs inside the kernel, safely, without modifying the kernel source or loading traditional kernel modules. Originally designed as a packet filter in 1992, it has been rebuilt into a general-purpose instrumentation framework that powers tracing, networking, security, and scheduling on every modern Linux system.
 
@@ -3473,7 +3687,7 @@ No kernel patches needed. Stock tracepoints cover the high-volume events (alloc,
 
 ---
 
-## Part 16: Building a Page Lifecycle Tracer with eBPF {#part-16-building-a-page-lifecycle-tracer-with-ebpf}
+## Part 18: Building a Page Lifecycle Tracer with eBPF {#part-18-building-a-page-lifecycle-tracer-with-ebpf}
 
 Now we put it all together. The goal: track every physical page from allocation through page cache insertion, fault, dirty, writeback, I/O, and free. Userspace reads a stream of events from the BPF ring buffer and can reconstruct any page's history at any point.
 
@@ -4851,7 +5065,7 @@ Because events are a stream (not pre-aggregated), userspace has full flexibility
 
 ---
 
-## Part 17: Operating the Tracer — Build, Run, Debug, Tune {#part-17-operating-the-tracer-build-run-debug-tune}
+## Part 19: Operating the Tracer — Build, Run, Debug, Tune {#part-19-operating-the-tracer-build-run-debug-tune}
 
 The code is written. Now you need to build it, run it, verify it works, and tune it when it doesn't. This part is the operator's guide.
 
@@ -5092,11 +5306,11 @@ When using the Perfetto C SDK, the cleanup is triggered by the data source `on_s
 
 ---
 
-## Part 18: Perfetto Integration {#part-18-perfetto-integration}
+## Part 20: Perfetto Integration {#part-20-perfetto-integration}
 
 ### Why Perfetto instead of custom JSON
 
-The tracer in Part 16 writes NDJSON from custom C. That works for prototyping but does not scale to production analysis. Perfetto replaces the custom output pipeline:
+The tracer in Part 18 writes NDJSON from custom C. That works for prototyping but does not scale to production analysis. Perfetto replaces the custom output pipeline:
 
 ```
 Ring buffer → Perfetto C SDK data source → TracePacket →
@@ -5192,7 +5406,7 @@ The resulting trace contains both page lifecycle events and standard ftrace even
 
 ---
 
-## Part 19: Android-Specific Considerations {#part-19-android-specific-considerations}
+## Part 21: Android-Specific Considerations {#part-21-android-specific-considerations}
 
 ### Kernel requirements
 
@@ -5212,7 +5426,7 @@ No kernel patches are needed. Stock GKI works with all the tracepoints and kprob
 
 ### zRAM instead of disk swap
 
-Android uses zRAM exclusively for swap. Part 12 covers zRAM internals; here we note the tracer implications. The tracer hooks `zram_write_page` via kprobe to capture compression events. After compression, the page's PFN is freed — the data exists as a zsmalloc handle, not at a PFN. The `page_id` in the `pfn_to_id` map persists until the free event cleans it up.
+Android uses zRAM exclusively for swap. Part 13 covers zRAM internals; here we note the tracer implications. The tracer hooks `zram_write_page` via kprobe to capture compression events. After compression, the page's PFN is freed — the data exists as a zsmalloc handle, not at a PFN. The `page_id` in the `pfn_to_id` map persists until the free event cleans it up.
 
 On swap-in, a new PFN is allocated. The tracer sees `EVT_ALLOC` for the new PFN. Connecting the swap-out and swap-in requires tracking the swap entry through `folio->swap` — a limitation acknowledged in Part 16's swap correlation section.
 
@@ -5268,7 +5482,7 @@ The tracer's `tgid` field on each event lets you correlate page lifecycle events
 
 ---
 
-## Part 20: Historical Context — How We Got Here {#part-20-historical-context-how-we-got-here}
+## Part 22: Historical Context — How We Got Here {#part-22-historical-context-how-we-got-here}
 
 ### The evolution of struct page
 
@@ -5386,218 +5600,6 @@ If you want to dive deeper into any part of what we've covered, these are the ca
 - `kernel/bpf/core.c` (`___bpf_prog_run`) — the BPF interpreter.
 
 The kernel source is the primary source of truth. Every book and article drifts; the code doesn't.
-
----
-
-## Part 21: The Linux Scheduler {#part-21-the-linux-scheduler}
-
-The scheduler answers one question: which thread runs next on this CPU? The kernel has hundreds or thousands of runnable threads and maybe 4–8 CPU cores. The scheduler picks one thread per core, lets it run for a while, then picks another.
-
-The scheduler runs in two situations. First, **voluntarily**: a thread calls `schedule()` because it is about to sleep — waiting for I/O, a lock, a futex, a timer. The scheduler picks the next thread from the runqueue. Second, **involuntarily (preemption)**: a thread's time slice expires, or a higher-priority thread wakes up. The scheduler sets `TIF_NEED_RESCHED` on the running thread. At the next preemption point (return from syscall, return from interrupt, explicit `cond_resched()`), the kernel calls `schedule()`.
-
-Context switching means saving the current thread's register state (stack pointer, program counter, callee-saved registers) and restoring the next thread's. On ARM64 this is `__switch_to` — about 20 instructions. The expensive part is not the register swap but the cache and TLB pollution: the new thread's working set is cold.
-
-### Scheduling classes
-
-The kernel has a hierarchy of scheduling classes, checked in priority order:
-
-```
-stop_sched_class       → migration threads (highest, internal only)
-dl_sched_class         → SCHED_DEADLINE (earliest deadline first)
-rt_sched_class         → SCHED_FIFO, SCHED_RR (fixed priority, real-time)
-fair_sched_class       → SCHED_NORMAL, SCHED_BATCH (CFS/EEVDF, the default)
-idle_sched_class       → SCHED_IDLE (lowest, runs when nothing else can)
-```
-
-The scheduler checks each class in order. If the RT class has a runnable thread, it runs before any CFS thread, unconditionally. A SCHED_DEADLINE thread runs before any RT thread. This ordering is absolute — a nice -20 CFS thread will never preempt a nice +19 RT thread.
-
-On Android, most app threads are SCHED_NORMAL (CFS). Audio threads are SCHED_FIFO (RT). The display compositor (SurfaceFlinger) runs at RT priority.
-
-### CFS and vruntime
-
-CFS (Completely Fair Scheduler, merged in 2.6.23) tracks how much CPU time each thread has received and always runs the thread that has received the least. Every CFS thread has a `vruntime` field in its `struct sched_entity`:
-
-```c
-struct sched_entity {
-    struct load_weight  load;       // weight derived from nice
-    struct rb_node      run_node;   // position in the rbtree
-    u64                 vruntime;   // virtual runtime in nanoseconds
-    u64                 sum_exec_runtime;
-};
-```
-
-`vruntime` is wall-clock time scaled by the thread's weight. A thread with twice the weight accumulates vruntime at half the rate — it can run twice as long before its vruntime catches up. The scheduler always picks the thread with the smallest vruntime.
-
-When a thread runs for `delta_exec` nanoseconds:
-
-```c
-vruntime += delta_exec * NICE_0_LOAD / weight;
-```
-
-`NICE_0_LOAD` is 1024. A nice -5 thread (weight 3121) advances vruntime at 1024/3121 ≈ 0.33× — it gets ~3× more CPU than a nice-0 thread. A nice +5 thread (weight 335) advances at 1024/335 ≈ 3×, getting ~1/3 the CPU.
-
-The nice-to-weight table is at `kernel/sched/core.c`:
-
-```c
-static const int sched_prio_to_weight[40] = {
- /* -20 */ 88761, 71755, 56483, 46273, 36291,
- /* -15 */ 29154, 23254, 18705, 14949, 11916,
- /* -10 */  9548,  7620,  6100,  4904,  3906,
- /*  -5 */  3121,  2501,  1991,  1586,  1277,
- /*   0 */  1024,   820,   655,   526,   423,
- /*   5 */   335,   272,   215,   172,   137,
- /*  10 */   110,    87,    70,    56,    45,
- /*  15 */    36,    29,    23,    18,    15,
-};
-```
-
-Each nice level changes weight by ~25%. Android sets foreground threads to nice -10 (weight 9548) and background to nice +10 (weight 110) — a ratio of ~87×.
-
-Kernel 6.6 replaced classic CFS with **EEVDF** (Earliest Eligible Virtual Deadline First). The rbtree is now sorted by virtual deadline rather than raw vruntime. EEVDF assigns each thread a virtual deadline = vruntime + (time slice / weight). The data structure is still an rbtree; the comparison key changed.
-
-### RT scheduling
-
-RT threads have fixed priorities from 1 to 99. Every RT thread runs before any CFS thread. Within RT, **SCHED_FIFO** threads run until they yield or block — no time slicing. **SCHED_RR** adds time slicing among same-priority threads (default 100ms quantum).
-
-The RT runqueue is a bitmap + per-priority linked list. `pick_next_task_rt` finds the highest set bit (one instruction) and takes the first entry. O(1).
-
-**Priority inversion.** High-priority thread H blocks on a mutex held by low-priority thread L. Medium-priority thread M preempts L. H starves. **Priority inheritance (PI) mutexes** fix this: when H blocks on a PI mutex held by L, the kernel boosts L to H's priority. On Android, Binder transactions use PI-aware mutexes for the audio and display paths.
-
-**RT throttling.** `/proc/sys/kernel/sched_rt_runtime_us` (default 950000) limits RT threads to 950ms per 1s per CPU. The remaining 50ms is guaranteed for CFS threads so you can ssh in and kill a runaway RT process.
-
-### SCHED_DEADLINE
-
-EDF (Earliest Deadline First) scheduling. Each thread declares runtime, deadline, and period. The scheduler guarantees completion before the deadline if CPU capacity permits. SCHED_DEADLINE threads preempt RT threads. A natural fit for display rendering (16ms deadline per frame) and audio (10ms per buffer).
-
-### sched_ext: BPF-based scheduling
-
-Merged in kernel 6.12. `sched_ext` lets you write a scheduler in BPF. The kernel provides callbacks (`select_cpu`, `enqueue`, `dequeue`, `dispatch`). You implement them in BPF, load them, and they replace CFS for `SCHED_EXT` threads. If your BPF scheduler crashes, the kernel falls back to CFS.
-
-Why this matters for mm: a BPF scheduler can access `task_struct→mm→rss_stat` and deprioritize threads whose working set is being reclaimed (they will just fault and stall anyway) or boost threads whose I/O just completed (their pages are hot).
-
-### How the scheduler connects to mm
-
-**Page fault.** A major fault calls `folio_wait_locked` → `schedule()` → thread sleeps until I/O completes. The scheduler picks another thread. When the I/O completes, the faulting thread is re-enqueued. Its vruntime has not advanced during sleep, so it runs promptly.
-
-**Direct reclaim.** When `alloc_pages` cannot find free memory, the allocating thread enters direct reclaim — it does kswapd's work itself. The thread is still on-CPU (not sleeping), doing reclaim work instead of application work. This can take milliseconds. Direct reclaim is the single biggest source of unpredictable latency in Linux.
-
-**kswapd.** Background reclaim daemon at nice -5 (weight 3121). Competes with normal threads via CFS. At nice -5 it gets ~3× more CPU than a nice-0 thread, but a CPU-bound app can slow kswapd, causing more direct reclaim.
-
-**Futex / mutex.** When a thread blocks on a futex, it calls `schedule()`. When the holder unlocks, `futex_wake` wakes the blocked thread. If the blocked thread has a smaller vruntime, it may preempt the unlocking thread immediately.
-
----
-
-## Part 22: The VFS and Filesystem Layer {#part-22-the-vfs-and-filesystem-layer}
-
-Between "look up page in page cache" and "submit bio to block layer," there is a layer the mm chapters cover quickly: the filesystem. This is where file offsets become disk sectors, where metadata is managed, and where the filesystem's on-disk layout affects I/O patterns.
-
-```
-Userspace:     read(fd, buf, 4096)
-VFS:           vfs_read → generic_file_read_iter
-Page cache:    filemap_read → filemap_get_pages
-               "is page N of this file in RAM?"
-                    │ (cache miss)
-Filesystem:    a_ops->readahead → ext4_readahead / f2fs_readahead
-               "page N of this file is at disk sector S"
-                    │
-Block layer:   submit_bio → blk_mq → driver → hardware
-```
-
-### The VFS abstraction
-
-The Virtual File System dispatches to filesystem-specific implementations via function pointers. The kernel never calls ext4 or f2fs directly.
-
-```c
-struct inode {
-    umode_t              i_mode;
-    unsigned long        i_ino;
-    loff_t               i_size;
-    struct super_block  *i_sb;
-    struct address_space i_data;     // page cache (embedded, not a pointer)
-    struct inode_operations *i_op;   // lookup, create, link
-    struct file_operations  *i_fop;  // read, write, mmap
-};
-```
-
-The `address_space` (Part 4.10) is embedded directly inside `struct inode` as `i_data`. One inode, one page cache.
-
-### File offset → disk sector translation
-
-This is the filesystem's core job for I/O. Given a file and a page offset, where on disk are those bytes?
-
-**ext4: extent tree.** An extent says "file bytes [start, start+len) are stored at disk block B." When the page cache needs page 130, `ext4_map_blocks` walks the extent tree in the inode to find the physical block number, then converts to a sector number for the bio.
-
-**f2fs (default on Android).** Log-structured design optimized for flash. Data blocks and node blocks (metadata) are separate. f2fs writes new data sequentially to clean segments, never overwriting in place. This aligns with flash hardware, which cannot overwrite — it must erase first. The translation goes through a node block that maps file offsets to physical data block addresses.
-
-f2fs has its own garbage collection (GC) thread that reads live blocks from old segments and rewrites them to new segments. This is f2fs-level GC on top of the FTL's own GC. Both compete for flash bandwidth — double GC is a real performance problem on Android.
-
-### address_space_operations
-
-The page cache calls the filesystem through these callbacks:
-
-```c
-struct address_space_operations {
-    int (*writepages)(struct address_space *, struct writeback_control *);
-    int (*readahead)(struct readahead_control *);
-    bool (*dirty_folio)(struct address_space *, struct folio *);
-    int (*write_begin)(struct file *, struct address_space *, loff_t,
-                       unsigned, struct folio **, void **);
-    int (*write_end)(struct file *, struct address_space *, loff_t,
-                     unsigned, unsigned, struct folio *, void *);
-};
-```
-
-**readahead** is called by the readahead engine (Part 10). The filesystem translates file offsets to disk sectors, builds bios, and submits them. **writepages** is called by writeback (Part 9) — same translation, opposite direction. **dirty_folio** tags the page in the xarray and marks the inode dirty. **write_begin/write_end** handle the `write()` syscall path — `write_begin` allocates disk blocks if the file is growing, `write_end` marks the page dirty.
-
-### The fsync path
-
-`fsync(fd)` guarantees data and metadata are on stable storage when it returns:
-
-```
-fsync(fd)
-  → file->f_op->fsync → ext4_sync_file
-    → filemap_write_and_wait_range   (write dirty pages, wait for I/O)
-    → jbd2_complete_transaction      (wait for journal commit)
-    → return 0 or -EIO
-```
-
-The `filemap_write_and_wait_range` call is what the tracer captures — EVT_WRITEBACK, EVT_IO_ISSUE, EVT_IO_COMPLETE, EVT_WB_DONE for each dirty page. The journal commit (step 2) is additional metadata I/O that the page tracer does not capture. To trace full fsync latency, hook `ext4_sync_file` or `f2fs_sync_file` directly.
-
-### Direct I/O
-
-`O_DIRECT` bypasses the page cache entirely. Reads and writes go from userspace buffers straight to bios and disk. The tracer will not see direct I/O through page lifecycle events — no EVT_ALLOC, no EVT_CACHE_INSERT. To trace direct I/O, hook `__blockdev_direct_IO` or the iomap direct I/O path.
-
-### The dentry cache and inode cache
-
-Two caches above the page cache:
-
-**Dentry cache (dcache).** Maps (parent dentry, name) → child dentry. Hit rate is typically >99%. Avoids reading directory blocks from disk for every `open()`.
-
-**Inode cache.** Every inode read from disk is cached in `inode_cache` slab. The cached inode contains the file's metadata and the `address_space` (page cache). Evicting an inode from the cache also evicts its page cache pages — the tracer sees a burst of EVT_CACHE_REMOVE events when the inode shrinker runs.
-
-Both caches are reclaimable. `echo 2 > /proc/sys/vm/drop_caches` shrinks both. Shrinking the dcache forces future path lookups to go to disk; shrinking the inode cache forces re-reading metadata and re-populating the page cache.
-
-### Where the tracer hooks into the filesystem
-
-The page lifecycle tracer captures the filesystem's interaction implicitly:
-
-```
-Filesystem call          Tracer event           How
-──────────────────────────────────────────────────────────────
-a_ops->readahead         EVT_ALLOC              page allocated for readahead
-  → filemap_add_folio    EVT_CACHE_INSERT       page enters cache
-  → bio_add_folio        EVT_READ               bio built with page + sector
-  → submit_bio           EVT_IO_ISSUE           dispatched to hardware
-  → folio_end_read       EVT_READ_DONE          data arrived
-
-a_ops->writepages        EVT_WRITEBACK          bio built for dirty page
-  → submit_bio           EVT_IO_ISSUE
-  → folio_end_writeback  EVT_WB_DONE
-
-a_ops->dirty_folio       EVT_DIRTY              page marked dirty
-```
-
-To trace filesystem-specific operations (journal commits, f2fs GC, extent allocation), add kprobes on fs-specific functions. These would be additional events, separate from the page lifecycle but correlatable by timestamp and tgid.
 
 ---
 
